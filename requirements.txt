@@ -1,5 +1,4 @@
 streamlit
-taipy
 python-pptx
 opencv-python-headless
 numpy
