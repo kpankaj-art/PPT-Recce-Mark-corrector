@@ -1,21 +1,26 @@
+import streamlit as st
 import cv2
 import numpy as np
+from pptx import Presentation
+from pptx.util import Inches
+import io
+from PIL import Image
 
-def fix_any_color_drawn_box(image_path, output_path):
-    img = cv2.imread(image_path)
+def fix_drawn_box_in_image(image_bytes):
+    # Image bytes ko OpenCV format me convert karna
+    file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    
+    if img is None:
+        return image_bytes, False
+        
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # 1. Image Noise & Texture ko smooth karna
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-    
-    # 2. Edges detect karna (Color chahe koi bhi ho)
     edges = cv2.Canny(blurred, 30, 150)
     
-    # Lines ko thoda connect/Thick karna taaki gaps fill ho jayein
     kernel = np.ones((5, 5), np.uint8)
     dilated_edges = cv2.dilate(edges, kernel, iterations=2)
     
-    # 3. Contours (Shapes) find karna
     contours, _ = cv2.findContours(dilated_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     best_rect = None
@@ -24,13 +29,7 @@ def fix_any_color_drawn_box(image_path, output_path):
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        # Background Noise ignore karne ke liye Area thresholding
         if area > 1500 and area < (img.shape[0] * img.shape[1] * 0.8):
-            # Shape Boundary check karna
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-            
-            # Agar stroke ek closed shape (3 se 8 corners) bana raha hai
             if area > max_area:
                 max_area = area
                 best_rect = cv2.boundingRect(cnt)
@@ -38,14 +37,62 @@ def fix_any_color_drawn_box(image_path, output_path):
 
     if best_rect is not None:
         x, y, w, h = best_rect
-        
-        # 4. Inpainting: Har color ki line ko erase kar background blend karna
         clean_img = cv2.inpaint(img, mask, inpaintRadius=7, flags=cv2.INPAINT_TELEA)
+        # Green Perfect Straight Box Draw Karna
+        cv2.rectangle(clean_img, (x, y), (x + w, y + h), (0, 255, 0), 4)
         
-        # 5. Fixed Standard Color (e.g. Green ya Red) ka Perfect Straight Box draw karna
-        cv2.rectangle(clean_img, (x, y), (x + w, y + h), (0, 255, 0), 3)
-        
-        cv2.imwrite(output_path, clean_img)
-        return True
+        # Fixed Image ko PNG bytes me convert karke return karna
+        _, encoded_img = cv2.imencode('.png', clean_img)
+        return encoded_img.tobytes(), True
 
-    return False
+    return image_bytes, False
+
+def process_ppt(ppt_bytes):
+    prs = Presentation(io.BytesIO(ppt_bytes))
+    modified = False
+
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if shape.shape_type == 13: # 13 = Picture shape type
+                image_stream = shape.image.blob
+                fixed_image_bytes, is_modified = fix_drawn_box_in_image(image_stream)
+                
+                if is_modified:
+                    modified = True
+                    # Slide me purani image ko naye fixed image se replace karna
+                    new_img_stream = io.BytesIO(fixed_image_bytes)
+                    left, top, width, height = shape.left, shape.top, shape.width, shape.height
+                    
+                    # Purani image shape ko remove karke naye image ko add karna
+                    sp = shape._element
+                    sp.getparent().remove(sp)
+                    slide.shapes.add_picture(new_img_stream, left, top, width, height)
+
+    out_stream = io.BytesIO()
+    prs.save(out_stream)
+    out_stream.seek(0)
+    return out_stream.getvalue(), modified
+
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="PPT Recce Mark Corrector", layout="centered")
+
+st.title("PPT Recce Mark Corrector")
+st.write("PPT upload karein, ye tool hand-drawn (tedhe-medhe) boxes ko automatically straight green boxes me fix kar dega.")
+
+uploaded_ppt = st.file_uploader("Apni PowerPoint (.pptx) file choose karein", type=["pptx"])
+
+if uploaded_ppt is not None:
+    if st.button("Process PPT", type="primary"):
+        with st.spinner("Images scan aur clean ho rahi hain..."):
+            processed_ppt_bytes, status = process_ppt(uploaded_ppt.read())
+            
+            if status:
+                st.success("PPT Successfully Process Ho Gayi Hai!")
+                st.download_button(
+                    label="Download Fixed PPT",
+                    data=processed_ppt_bytes,
+                    file_name=f"Fixed_{uploaded_ppt.name}",
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                )
+            else:
+                st.warning("PPT ke images me koi hand-drawn marker box detect nahi hua.")
