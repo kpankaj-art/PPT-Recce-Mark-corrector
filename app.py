@@ -1,19 +1,20 @@
 import io
 import json
 import warnings
+import numpy as np
+import cv2
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from google import genai
-from google.genai import types
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="PPT Image Cleaner AI", page_icon="🎨", layout="centered")
+st.set_page_config(page_title="PPT Image Line Cleaner", page_icon="🎨", layout="centered")
 
-st.title("🎨 AI PPT Image Mark Removal Tool")
-st.write("Photo ke andar merged (drawn) lines ko AI automatically clean karke neat rectangular border me convert kar dega.")
+st.title("🎨 PPT Hand-drawn Line Erase & Border Tool")
+st.write("Photo ke andar ki rough markings ko detect karke unhe erase karega aur clean rectangular border banaye ka.")
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
@@ -22,40 +23,77 @@ def get_client(api_key):
     return genai.Client(api_key=api_key)
 
 if not GEMINI_API_KEY:
-    st.error("Secrets mein GEMINI_API_KEY missing hai!")
+    st.error("Streamlit Secrets mein GEMINI_API_KEY missing hai!")
     st.stop()
 
 client = get_client(GEMINI_API_KEY)
 
-def clean_image_with_ai(pil_image):
-    """
-    Directly asks Gemini Vision to detect and remove burnt-in markings 
-    from the image pixels while keeping the original shop/object background intact.
-    """
+def detect_marking_area(pil_image):
+    """Gemini Flash se image ke andar ki rough line/annotation ka bounding box aur color nikalna"""
     prompt = """
-    This image contains hand-drawn irregular red/colored lines or rough freehand markings over shop boards or objects.
-    Task:
-    1. Remove all hand-drawn irregular lines, circles, and rough markings.
-    2. Seamlessly restore the background texture/text behind those markings.
-    3. Draw a clean, straight, professional rectangular bounding box of the exact same color around that specific object/board.
+    Analyze this image for hand-drawn irregular lines, circles, scribble marks, or rough freehand boxes over shop boards/objects.
+    Respond strictly in JSON format:
+    {
+      "has_mark": true,
+      "color": [R, G, B],
+      "box_percent": [ymin, xmin, ymax, xmax]
+    }
+    where box_percent contains percentage coordinates (0 to 100) tightly surrounding the hand-drawn mark.
     """
     try:
-        # Request Image Generation / Editing via Gemini Vision
-        response = client.models.generate_images(
-            model='imagen-3.0-generate-002',
-            prompt=prompt,
-            config=types.GenerateImagesConfig(
-                number_of_images=1,
-                output_mime_type="image/png",
-                aspect_ratio="1:1"
-            )
+        response = client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=[pil_image, prompt]
         )
-        # Return edited image bytes
-        for generated_image in response.generated_images:
-            return Image.open(io.BytesIO(generated_image.image.image_bytes))
+        clean_text = response.text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(clean_text)
+
+        if not data.get("has_mark", False):
+            return None, None
+
+        box = data["box_percent"]
+        color = tuple(data.get("color", [255, 0, 0]))
+        return box, color
     except Exception:
-        # Fallback if image generation model is restricted
-        return pil_image
+        return None, None
+
+def remove_mark_and_draw_rect(pil_image, box, color):
+    """Computer Vision Inpainting: Rough merged drawing ko erase karke clean rectangle draw karna"""
+    w, h = pil_image.size
+    ymin = int((box[0] / 100) * h)
+    xmin = int((box[1] / 100) * w)
+    ymax = int((box[2] / 100) * h)
+    xmax = int((box[3] / 100) * w)
+
+    # Convert PIL Image to OpenCV Format (BGR)
+    img_np = np.array(pil_image.convert("RGB"))
+    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+    # Create mask for the bounding box boundary (where hand drawn lines lie)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    
+    # 10px thick boundary line mask around detected object
+    thickness = 12
+    cv2.rectangle(
+        mask, 
+        (max(0, xmin - thickness), max(0, ymin - thickness)), 
+        (min(w, xmax + thickness), min(h, ymax + thickness)), 
+        255, 
+        thickness=thickness*2
+    )
+
+    # OpenCV Inpainting: Mitao rough lines by blending background pixels
+    inpainted_cv = cv2.inpaint(img_cv, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+
+    # Convert back to PIL Image
+    inpainted_rgb = cv2.cvtColor(inpainted_cv, cv2.COLOR_BGR2RGB)
+    cleaned_pil = Image.fromarray(inpainted_rgb)
+
+    # Draw fresh straight rectangular border over cleaned area
+    draw = ImageDraw.Draw(cleaned_pil)
+    draw.rectangle([xmin, ymin, xmax, ymax], outline=color, width=4)
+
+    return cleaned_pil
 
 def process_presentation(uploaded_file):
     prs = Presentation(uploaded_file)
@@ -64,39 +102,51 @@ def process_presentation(uploaded_file):
     progress_bar = st.progress(0)
     status_text = st.empty()
 
+    cleaned_count = 0
+
     for idx, slide in enumerate(prs.slides, start=1):
-        status_text.text(f"Processing Slide {idx}/{total_slides} (AI Pixel Inpainting)...")
+        status_text.text(f"Processing Slide {idx}/{total_slides}...")
         for shape in slide.shapes:
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                 try:
                     img_bytes = shape.image.blob
                     img_pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-                    # Process merged image through Gemini Cloud AI
-                    cleaned_pil = clean_image_with_ai(img_pil)
+                    # 1. Detection
+                    box, color = detect_marking_area(img_pil)
+                    
+                    if box:
+                        # 2. Erase rough mark & redraw clean box
+                        cleaned_pil = remove_mark_and_draw_rect(img_pil, box, color)
 
-                    output = io.BytesIO()
-                    cleaned_pil.save(output, format="PNG")
-                    shape.image.blob = output.getvalue()
+                        # 3. Save back into PPTX shape
+                        output = io.BytesIO()
+                        cleaned_pil.save(output, format="PNG")
+                        shape.image.blob = output.getvalue()
+                        cleaned_count += 1
                 except Exception:
                     pass
         progress_bar.progress(idx / total_slides)
 
-    status_text.text("Processing Complete!")
+    status_text.text(f"Processing Complete! Cleaned {cleaned_count} images.")
     
     ppt_out = io.BytesIO()
     prs.save(ppt_out)
     ppt_out.seek(0)
-    return ppt_out
+    return ppt_out, cleaned_count
 
 uploaded_file = st.file_uploader("Upload PowerPoint File (.pptx)", type=["pptx"])
 
 if uploaded_file is not None:
-    if st.button("Clean Hand-Drawn Marks & Fix PPT", type="primary"):
-        with st.spinner("Gemini Cloud AI images ke pixels se marks erase kar raha hai..."):
-            fixed_ppt = process_presentation(uploaded_file)
-            st.success("PPT Successfully Cleaned!")
+    if st.button("Fix & Clean PPT", type="primary"):
+        with st.spinner("AI photo me se rough lines erase kar ke straight box draw kar raha hai..."):
+            fixed_ppt, count = process_presentation(uploaded_file)
             
+            if count > 0:
+                st.success(f"Success! Total {count} images fix ho gayi hain.")
+            else:
+                st.info("Koi hand-drawn mark detect nahi hua ya PPT image format different hai.")
+
             st.download_button(
                 label="📥 Download Fixed PPT",
                 data=fixed_ppt,
