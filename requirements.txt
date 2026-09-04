@@ -2,4 +2,3 @@ streamlit
 python-pptx
 google-genai
 Pillow
-opencv-python-headless
