@@ -1,5 +1,5 @@
 streamlit
 python-pptx
-opencv-python-headless
-numpy
 pillow
+google-generativeai
+requests
