@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import gc
+import time
 import zipfile
 import tempfile
 import shutil
@@ -18,7 +19,7 @@ from openai import OpenAI
 
 
 # ============================================================
-# STREAMLIT SETTINGS
+# STREAMLIT
 # ============================================================
 
 st.set_page_config(
@@ -29,21 +30,17 @@ st.set_page_config(
 
 
 # ============================================================
-# APP SETTINGS
+# SETTINGS
 # ============================================================
 
 MAX_PPT_SIZE_MB = 300
 
-# Gemini/OpenAI ko bhejne se pehle image ka maximum side
+# Image Gemini/OpenAI ko bhejne se pehle maximum side
 MAX_AI_SIDE = 1280
 
-# Input JPEG quality
 JPEG_QUALITY = 82
-
-# Final image quality
 FINAL_JPEG_QUALITY = 92
 
-# Supported raster images
 SUPPORTED_EXTENSIONS = {
     ".jpg",
     ".jpeg",
@@ -52,7 +49,6 @@ SUPPORTED_EXTENSIONS = {
     ".bmp"
 }
 
-# Pillow safety
 Image.MAX_IMAGE_PIXELS = 40_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -61,7 +57,10 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # MODELS
 # ============================================================
 
+# IMPORTANT:
+# Stable model - preview model nahi
 GEMINI_MODEL = "gemini-2.5-flash-image"
+
 OPENAI_MODEL = "gpt-image-1"
 
 
@@ -70,192 +69,149 @@ OPENAI_MODEL = "gpt-image-1"
 # ============================================================
 
 AI_PROMPT = """
-You are editing a real field-survey / recce photograph.
+Edit this real field-survey / recce photograph.
 
-The photograph may contain a rough black hand-drawn marking,
-scribble, circle, irregular line, or freehand outline that is
-BAKED INTO THE IMAGE PIXELS.
+The image may contain a rough black hand-drawn marking,
+scribble, circle, irregular line, or freehand outline that
+is already BAKED INTO THE PHOTO PIXELS.
 
-Your job is to professionally clean that marking.
+TASK:
 
-VERY IMPORTANT:
+Remove the rough marking and replace it with one clean,
+professional rectangular marking around the SAME target.
 
-1. Detect the rough/irregular hand-drawn marking in the image.
+STRICT RULES:
 
-2. Remove ONLY the rough hand-drawn marking.
+1. Find the rough hand-drawn marking.
 
-3. Reconstruct the actual photograph underneath the removed
-   marking using surrounding pixels, textures, perspective,
-   lighting and scene geometry.
+2. Remove ONLY that rough marking.
 
-4. Identify the SAME real-world object or area that the rough
-   marking was intended to highlight.
+3. Reconstruct the photograph underneath the removed marking
+   using surrounding pixels, textures, colors, lighting,
+   perspective and scene geometry.
 
-5. Draw ONE clean professional rectangular outline around
-   that SAME target area.
+4. The rough marking indicates the target area.
+   Use that SAME area as the target.
 
-6. The new rectangle must have four straight sides.
+5. Draw ONE clean professional rectangle around the SAME target.
 
-7. Use a thin professional BLACK outline.
+6. Rectangle must have four straight sides.
 
-8. Do NOT fill the rectangle.
+7. Rectangle must be a thin BLACK outline.
 
-9. Do NOT use a circle.
+8. Rectangle must have NO fill.
 
-10. Do NOT use an oval.
+9. No circle.
 
-11. Do NOT use a scribble.
+10. No oval.
 
-12. Do NOT use an arrow.
+11. No scribble.
 
-13. Do NOT use glow, shadow or decorative effects.
+12. No arrow.
 
-14. Keep the new rectangle close to the original rough
-    marking boundaries.
+13. No glow.
 
-15. Do NOT move the target to another object.
+14. No shadow.
 
-16. Do NOT crop the image.
+15. No decorative effect.
 
-17. Keep exactly the same aspect ratio and composition.
+16. Do not move the rectangle to another object.
 
-18. Preserve people, vehicles, buildings, signs, boards,
-    text, colors, lighting, shadows and perspective.
+17. Keep the rectangle close to the original rough marking.
 
-19. Do NOT add new objects.
+18. Do not crop the image.
 
-20. Do NOT remove unrelated objects.
+19. Do not change the image aspect ratio.
 
-21. Do NOT rewrite or invent text.
+20. Do not change the composition.
 
-22. Do NOT change the overall photograph style.
+21. Preserve people.
 
-23. If there is no rough marking, return the image essentially
+22. Preserve vehicles.
+
+23. Preserve buildings.
+
+24. Preserve signs and boards.
+
+25. Preserve existing text.
+
+26. Do not invent or rewrite text.
+
+27. Preserve colors.
+
+28. Preserve lighting and shadows.
+
+29. Preserve perspective.
+
+30. Do not add unrelated objects.
+
+31. Do not remove unrelated objects.
+
+32. Do not modify areas outside the rough marking unless
+    absolutely necessary to reconstruct the background.
+
+33. If there is no rough marking, return the image essentially
     unchanged.
 
-24. The final result must look like a professional site-recce
-    photograph.
+34. The final result should look like a professional
+    site-recce photograph.
 
-25. The rough hand-drawn marking must be replaced by a neat,
-    straight, professional rectangular marking.
-
-26. Return ONLY the edited image.
+35. Return ONLY the edited image.
 """
 
 
 # ============================================================
-# UI HEADER
+# HELPERS
 # ============================================================
 
-st.title("🖼️ PPT Professional Marking AI")
-
-st.write(
-    "PPT ki photos me baked-in rough/hand-drawn markings "
-    "ko AI se clean karke professional rectangular marking "
-    "banaye."
-)
-
-st.info(
-    "Designed for large PPT files — approximately 300 MB "
-    "and 800+ slides. Images one-by-one process hoti hain "
-    "taaki RAM usage low rahe."
-)
+def cleanup_memory():
+    gc.collect()
 
 
-# ============================================================
-# AI PROVIDER
-# ============================================================
+def is_quota_zero_error(error_text):
+    text = str(error_text).lower()
 
-st.subheader("🤖 AI Provider")
-
-provider = st.radio(
-    "Kis AI ki API use karni hai?",
-    [
-        "Google Gemini",
-        "OpenAI"
-    ],
-    horizontal=True
-)
-
-
-# ============================================================
-# API KEY INPUT
-# ============================================================
-
-if provider == "Google Gemini":
-
-    st.subheader("🔑 Gemini API Key")
-
-    api_key = st.text_input(
-        "Gemini API Key",
-        type="password",
-        placeholder="AIza...",
-        help="Google AI Studio se Gemini API key paste karo."
+    return (
+        "limit: 0" in text
+        or "quota_limit_value: 0" in text
+        or "free_tier" in text and "limit: 0" in text
     )
 
-    if not api_key:
-        st.info(
-            "Gemini API key enter karo."
-        )
-        st.stop()
 
-    try:
+def is_retryable_error(error_text):
+    text = str(error_text).lower()
 
-        client = genai.Client(
+    return (
+        "429" in text
+        or "resource_exhausted" in text
+        or "rate limit" in text
+        or "too many requests" in text
+        or "503" in text
+        or "unavailable" in text
+    )
+
+
+# ============================================================
+# API CLIENT
+# ============================================================
+
+def create_client(provider, api_key):
+
+    if provider == "Google Gemini":
+
+        return genai.Client(
             api_key=api_key
         )
 
-        st.success(
-            "✅ Gemini API ready"
-        )
+    else:
 
-    except Exception as e:
-
-        st.error(
-            f"❌ Gemini API error: {e}"
-        )
-
-        st.stop()
-
-
-else:
-
-    st.subheader("🔑 OpenAI API Key")
-
-    api_key = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        placeholder="sk-...",
-        help="OpenAI Platform se API key paste karo."
-    )
-
-    if not api_key:
-        st.info(
-            "OpenAI API key enter karo."
-        )
-        st.stop()
-
-    try:
-
-        client = OpenAI(
+        return OpenAI(
             api_key=api_key
         )
 
-        st.success(
-            "✅ OpenAI API ready"
-        )
-
-    except Exception as e:
-
-        st.error(
-            f"❌ OpenAI API error: {e}"
-        )
-
-        st.stop()
-
 
 # ============================================================
-# SAVE UPLOADED FILE TO DISK
+# SAVE UPLOADED PPT TO DISK
 # ============================================================
 
 def save_uploaded_file(uploaded_file, destination):
@@ -275,7 +231,7 @@ def save_uploaded_file(uploaded_file, destination):
 
 
 # ============================================================
-# FIND ALL IMAGES USED BY PPT SLIDES
+# FIND PPT IMAGES
 # ============================================================
 
 def get_slide_media_references(ppt_path):
@@ -290,10 +246,6 @@ def get_slide_media_references(ppt_path):
         names = set(
             zin.namelist()
         )
-
-        # ----------------------------------------------
-        # Read slide relationship files
-        # ----------------------------------------------
 
         for rels_name in names:
 
@@ -346,18 +298,9 @@ def get_slide_media_references(ppt_path):
                         rid
                     ] = "ppt/media/" + filename
 
-            # ------------------------------------------
-            # Get actual slide XML
-            # ------------------------------------------
-
             rel_filename = Path(
                 rels_name
             ).name
-
-            if not rel_filename.endswith(
-                ".rels"
-            ):
-                continue
 
             slide_filename = rel_filename[
                 :-5
@@ -384,10 +327,6 @@ def get_slide_media_references(ppt_path):
             except Exception:
 
                 continue
-
-            # ------------------------------------------
-            # Find r:embed references
-            # ------------------------------------------
 
             for element in slide_root.iter():
 
@@ -428,19 +367,11 @@ def prepare_image_for_ai(
         original_width = img.width
         original_height = img.height
 
-        # ------------------------------------------
-        # Convert to RGB
-        # ------------------------------------------
-
         if img.mode != "RGB":
 
             img = img.convert(
                 "RGB"
             )
-
-        # ------------------------------------------
-        # Resize for AI
-        # ------------------------------------------
 
         max_side = max(
             img.size
@@ -471,18 +402,13 @@ def prepare_image_for_ai(
                 Image.Resampling.LANCZOS
             )
 
-        # ------------------------------------------
-        # Save temporary AI image
-        # ------------------------------------------
-
         img.save(
             ai_path,
             format="JPEG",
-            quality=JPEG_QUALITY,
-            optimize=False
+            quality=JPEG_QUALITY
         )
 
-    gc.collect()
+    cleanup_memory()
 
     return (
         original_width,
@@ -491,7 +417,7 @@ def prepare_image_for_ai(
 
 
 # ============================================================
-# GEMINI PROCESSING
+# GEMINI IMAGE EDIT
 # ============================================================
 
 def process_with_gemini(
@@ -500,77 +426,143 @@ def process_with_gemini(
     output_path
 ):
 
-    with open(
-        ai_path,
-        "rb"
-    ) as f:
+    MAX_RETRIES = 3
 
-        image_bytes = f.read()
+    for attempt in range(
+        MAX_RETRIES
+    ):
 
-    try:
+        try:
 
-        response = client.models.generate_content(
+            with open(
+                ai_path,
+                "rb"
+            ) as image_file:
 
-            model=GEMINI_MODEL,
-
-            contents=[
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type="image/jpeg"
-                ),
-                AI_PROMPT
-            ],
-
-            config=types.GenerateContentConfig(
-                response_modalities=[
-                    "IMAGE"
-                ]
-            )
-        )
-
-    finally:
-
-        del image_bytes
-
-        gc.collect()
-
-    generated_data = None
-
-    if response.parts:
-
-        for part in response.parts:
-
-            if part.inline_data is not None:
-
-                generated_data = (
-                    part.inline_data.data
+                image_bytes = (
+                    image_file.read()
                 )
 
-                break
+            try:
 
-    if not generated_data:
+                response = (
+                    client.models.generate_content(
 
-        raise RuntimeError(
-            "Gemini ne image output nahi diya."
-        )
+                        model=GEMINI_MODEL,
 
-    with open(
-        output_path,
-        "wb"
-    ) as f:
+                        contents=[
+                            types.Part.from_bytes(
+                                data=image_bytes,
+                                mime_type="image/jpeg"
+                            ),
+                            AI_PROMPT
+                        ],
 
-        f.write(
-            generated_data
-        )
+                        config=(
+                            types.GenerateContentConfig(
+                                response_modalities=[
+                                    "IMAGE"
+                                ]
+                            )
+                        )
+                    )
+                )
 
-    del generated_data
-    del response
+            finally:
 
-    gc.collect()
+                del image_bytes
+
+                cleanup_memory()
+
+            generated_data = None
+
+            if response.parts:
+
+                for part in response.parts:
+
+                    if (
+                        part.inline_data
+                        is not None
+                    ):
+
+                        generated_data = (
+                            part.inline_data.data
+                        )
+
+                        break
+
+            if not generated_data:
+
+                raise RuntimeError(
+                    "Gemini ne image output nahi diya."
+                )
+
+            with open(
+                output_path,
+                "wb"
+            ) as output:
+
+                output.write(
+                    generated_data
+                )
+
+            del generated_data
+            del response
+
+            cleanup_memory()
+
+            return True, None
+
+        except Exception as e:
+
+            error_text = str(e)
+
+            # -----------------------------------------
+            # Quota is literally ZERO
+            # -----------------------------------------
+
+            if is_quota_zero_error(
+                error_text
+            ):
+
+                raise RuntimeError(
+                    "Gemini image-generation quota "
+                    "ZERO hai.\n\n"
+                    "Ye API key format ki problem nahi hai. "
+                    "Google project ke current tier me "
+                    "image model ka quota 0 hai.\n\n"
+                    "Google AI Studio me billing/paid tier "
+                    "enable karke dobara try karo."
+                )
+
+            # -----------------------------------------
+            # Temporary 429 / 503
+            # -----------------------------------------
+
+            if (
+                is_retryable_error(
+                    error_text
+                )
+                and attempt < MAX_RETRIES - 1
+            ):
+
+                wait_seconds = (
+                    8 * (2 ** attempt)
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+                cleanup_memory()
+
+                continue
+
+            raise
 
 
 # ============================================================
-# OPENAI PROCESSING
+# OPENAI IMAGE EDIT
 # ============================================================
 
 def process_with_openai(
@@ -579,7 +571,6 @@ def process_with_openai(
     output_path
 ):
 
-    # OpenAI image edit
     with open(
         ai_path,
         "rb"
@@ -606,7 +597,9 @@ def process_with_openai(
             "OpenAI ne image output nahi diya."
         )
 
-    image_result = result.data[0]
+    image_result = (
+        result.data[0]
+    )
 
     if not image_result.b64_json:
 
@@ -621,20 +614,20 @@ def process_with_openai(
     with open(
         output_path,
         "wb"
-    ) as f:
+    ) as output:
 
-        f.write(
+        output.write(
             image_bytes
         )
 
     del image_bytes
     del result
 
-    gc.collect()
+    cleanup_memory()
 
 
 # ============================================================
-# RESTORE ORIGINAL IMAGE SIZE
+# RESTORE ORIGINAL SIZE
 # ============================================================
 
 def restore_original_size(
@@ -670,11 +663,10 @@ def restore_original_size(
         img.save(
             final_path,
             format="JPEG",
-            quality=FINAL_JPEG_QUALITY,
-            optimize=False
+            quality=FINAL_JPEG_QUALITY
         )
 
-    gc.collect()
+    cleanup_memory()
 
 
 # ============================================================
@@ -692,10 +684,6 @@ def process_one_image(
     extension = Path(
         media_path
     ).suffix.lower()
-
-    # ------------------------------------------
-    # Skip unsupported formats
-    # ------------------------------------------
 
     if extension not in SUPPORTED_EXTENSIONS:
 
@@ -732,9 +720,9 @@ def process_one_image(
 
     try:
 
-        # ==========================================
-        # EXTRACT ONLY ONE IMAGE
-        # ==========================================
+        # ==============================================
+        # Extract ONLY this image
+        # ==============================================
 
         with ppt_zip.open(
             media_path,
@@ -759,17 +747,17 @@ def process_one_image(
                         chunk
                     )
 
-        # ==========================================
-        # CHECK IMAGE
-        # ==========================================
+        # ==============================================
+        # Verify image
+        # ==============================================
 
         try:
 
             with Image.open(
                 original_path
-            ) as test_img:
+            ) as test_image:
 
-                test_img.verify()
+                test_image.verify()
 
         except Exception:
 
@@ -778,9 +766,9 @@ def process_one_image(
                 "invalid_image"
             )
 
-        # ==========================================
-        # PREPARE IMAGE
-        # ==========================================
+        # ==============================================
+        # Prepare AI image
+        # ==============================================
 
         (
             original_width,
@@ -790,9 +778,9 @@ def process_one_image(
             ai_path
         )
 
-        # ==========================================
+        # ==============================================
         # AI EDIT
-        # ==========================================
+        # ==============================================
 
         if provider == "Google Gemini":
 
@@ -810,9 +798,9 @@ def process_one_image(
                 generated_path
             )
 
-        # ==========================================
-        # RESTORE ORIGINAL SIZE
-        # ==========================================
+        # ==============================================
+        # Restore original dimensions
+        # ==============================================
 
         restore_original_size(
             generated_path,
@@ -821,11 +809,11 @@ def process_one_image(
             original_height
         )
 
-        # ==========================================
-        # DELETE TEMP FILES
-        # ==========================================
+        # ==============================================
+        # Remove temporary files
+        # ==============================================
 
-        for temp_file in [
+        for file_path in [
             original_path,
             ai_path,
             generated_path
@@ -834,17 +822,17 @@ def process_one_image(
             try:
 
                 if os.path.exists(
-                    temp_file
+                    file_path
                 ):
 
                     os.remove(
-                        temp_file
+                        file_path
                     )
 
             except Exception:
                 pass
 
-        gc.collect()
+        cleanup_memory()
 
         return (
             True,
@@ -853,9 +841,7 @@ def process_one_image(
 
     except Exception as e:
 
-        # Cleanup after error
-
-        for temp_file in [
+        for file_path in [
             original_path,
             ai_path,
             generated_path,
@@ -865,17 +851,17 @@ def process_one_image(
             try:
 
                 if os.path.exists(
-                    temp_file
+                    file_path
                 ):
 
                     os.remove(
-                        temp_file
+                        file_path
                     )
 
             except Exception:
                 pass
 
-        gc.collect()
+        cleanup_memory()
 
         return (
             False,
@@ -896,26 +882,28 @@ def build_final_ppt(
     with zipfile.ZipFile(
         original_ppt,
         "r"
-    ) as zin:
+    ) as source_zip:
 
         with zipfile.ZipFile(
             output_ppt,
             "w",
             compression=zipfile.ZIP_DEFLATED,
             compresslevel=6
-        ) as zout:
+        ) as output_zip:
 
-            for info in zin.infolist():
+            for info in source_zip.infolist():
 
                 filename = info.filename
 
-                replacement = replacements.get(
-                    filename
+                replacement = (
+                    replacements.get(
+                        filename
+                    )
                 )
 
-                # ======================================
-                # REPLACE IMAGE
-                # ======================================
+                # ==========================================
+                # Replace processed image
+                # ==========================================
 
                 if (
                     replacement
@@ -942,7 +930,7 @@ def build_final_ppt(
                         "rb"
                     ) as source:
 
-                        with zout.open(
+                        with output_zip.open(
                             new_info,
                             "w"
                         ) as destination:
@@ -960,18 +948,18 @@ def build_final_ppt(
                                     chunk
                                 )
 
-                # ======================================
-                # COPY EVERYTHING ELSE
-                # ======================================
+                # ==========================================
+                # Copy original PPT content
+                # ==========================================
 
                 else:
 
-                    with zin.open(
+                    with source_zip.open(
                         info,
                         "r"
                     ) as source:
 
-                        with zout.open(
+                        with output_zip.open(
                             info,
                             "w"
                         ) as destination:
@@ -989,7 +977,7 @@ def build_final_ppt(
                                     chunk
                                 )
 
-    gc.collect()
+    cleanup_memory()
 
 
 # ============================================================
@@ -1010,14 +998,101 @@ def cleanup_directory(
     except Exception:
         pass
 
-    gc.collect()
+    cleanup_memory()
+
+
+# ============================================================
+# API PROVIDER
+# ============================================================
+
+st.subheader("🤖 AI Provider")
+
+provider = st.radio(
+    "AI select karo:",
+    [
+        "Google Gemini",
+        "OpenAI"
+    ],
+    horizontal=True
+)
+
+
+# ============================================================
+# API KEY
+# ============================================================
+
+if provider == "Google Gemini":
+
+    st.subheader(
+        "🔑 Gemini API Key"
+    )
+
+    st.caption(
+        "AQ... wali Gemini Authorization API key bhi "
+        "yahan paste kar sakte ho."
+    )
+
+    api_key = st.text_input(
+        "Gemini API Key",
+        type="password",
+        placeholder="AQ....",
+        help="Google AI Studio ki Gemini API key."
+    )
+
+else:
+
+    st.subheader(
+        "🔑 OpenAI API Key"
+    )
+
+    api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        placeholder="sk-....",
+        help="OpenAI Platform ki API key."
+    )
+
+
+if not api_key:
+
+    st.info(
+        "Pehle API key enter karo."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# CREATE CLIENT
+# ============================================================
+
+try:
+
+    client = create_client(
+        provider,
+        api_key
+    )
+
+    st.success(
+        f"✅ {provider} API ready"
+    )
+
+except Exception as e:
+
+    st.error(
+        f"❌ API setup error: {e}"
+    )
+
+    st.stop()
 
 
 # ============================================================
 # PPT UPLOAD
 # ============================================================
 
-st.subheader("📂 Upload PowerPoint")
+st.subheader(
+    "📂 Upload PowerPoint"
+)
 
 uploaded_file = st.file_uploader(
     "PPTX file upload karo — maximum 300 MB",
@@ -1028,7 +1103,8 @@ uploaded_file = st.file_uploader(
 if uploaded_file:
 
     file_size_mb = (
-        uploaded_file.size /
+        uploaded_file.size
+        /
         (1024 * 1024)
     )
 
@@ -1036,21 +1112,13 @@ if uploaded_file:
         f"📦 PPT Size: **{file_size_mb:.2f} MB**"
     )
 
-    # ------------------------------------------
-    # Size check
-    # ------------------------------------------
-
     if file_size_mb > MAX_PPT_SIZE_MB:
 
         st.error(
-            f"❌ File {MAX_PPT_SIZE_MB} MB se badi hai."
+            "❌ PPT 300 MB se badi hai."
         )
 
         st.stop()
-
-    # ------------------------------------------
-    # Start button
-    # ------------------------------------------
 
     start = st.button(
         "🚀 Start Professional Processing",
@@ -1059,10 +1127,6 @@ if uploaded_file:
     )
 
     if start:
-
-        # ==========================================
-        # TEMP WORK DIRECTORY
-        # ==========================================
 
         work_dir = tempfile.mkdtemp(
             prefix="ppt_ai_"
@@ -1080,9 +1144,9 @@ if uploaded_file:
 
         try:
 
-            # ======================================
+            # ==========================================
             # SAVE PPT
-            # ======================================
+            # ==========================================
 
             with st.status(
                 "📥 PPT save ho rahi hai...",
@@ -1099,9 +1163,9 @@ if uploaded_file:
                     state="complete"
                 )
 
-            # ======================================
+            # ==========================================
             # FIND IMAGES
-            # ======================================
+            # ==========================================
 
             with st.status(
                 "🔎 PPT ke andar images identify ho rahi hain...",
@@ -1127,14 +1191,14 @@ if uploaded_file:
             if not media_paths:
 
                 st.warning(
-                    "PPT me supported images nahi mili."
+                    "PPT me supported raster images nahi mili."
                 )
 
                 st.stop()
 
-            # ======================================
-            # PROCESS IMAGES
-            # ======================================
+            # ==========================================
+            # PROCESS
+            # ==========================================
 
             st.subheader(
                 "⚙️ AI Image Processing"
@@ -1152,28 +1216,28 @@ if uploaded_file:
             failed_count = 0
             skipped_count = 0
 
-            # --------------------------------------
-            # Open PPT ZIP
-            # --------------------------------------
+            total_images = len(
+                media_paths
+            )
 
             with zipfile.ZipFile(
                 input_ppt,
                 "r"
             ) as ppt_zip:
 
-                total_images = len(
-                    media_paths
-                )
-
                 for index, media_path in enumerate(
                     media_paths,
                     start=1
                 ):
 
+                    filename = Path(
+                        media_path
+                    ).name
+
                     status_text.write(
                         f"🖼️ Processing "
                         f"{index}/{total_images}: "
-                        f"{Path(media_path).name}"
+                        f"{filename}"
                     )
 
                     ok, result = (
@@ -1202,29 +1266,52 @@ if uploaded_file:
 
                         failed_count += 1
 
-                        st.warning(
-                            f"⚠️ Failed: "
-                            f"{Path(media_path).name}\n\n"
-                            f"{result}"
-                        )
+                        # ----------------------------------
+                        # Special Gemini quota error
+                        # ----------------------------------
+
+                        if (
+                            provider == "Google Gemini"
+                            and
+                            (
+                                "quota" in str(
+                                    result
+                                ).lower()
+                                or
+                                "resource_exhausted"
+                                in str(
+                                    result
+                                ).lower()
+                            )
+                        ):
+
+                            st.error(
+                                "❌ Gemini quota problem\n\n"
+                                + str(result)
+                            )
+
+                            st.stop()
+
+                        else:
+
+                            st.warning(
+                                f"⚠️ Failed: {filename}\n\n"
+                                f"{result}"
+                            )
 
                     progress.progress(
                         index / total_images
                     )
 
-                    # ----------------------------------
-                    # Memory cleanup
-                    # ----------------------------------
-
-                    gc.collect()
+                    cleanup_memory()
 
             status_text.write(
                 "✅ AI image processing complete"
             )
 
-            # ======================================
+            # ==========================================
             # BUILD FINAL PPT
-            # ======================================
+            # ==========================================
 
             with st.status(
                 "📦 Final PPT ban rahi hai...",
@@ -1242,9 +1329,9 @@ if uploaded_file:
                     state="complete"
                 )
 
-            # ======================================
-            # FINAL RESULT
-            # ======================================
+            # ==========================================
+            # RESULT
+            # ==========================================
 
             final_size_mb = (
                 os.path.getsize(
@@ -1263,7 +1350,7 @@ if uploaded_file:
             with col1:
 
                 st.metric(
-                    "Images Processed",
+                    "Processed",
                     success_count
                 )
 
@@ -1281,9 +1368,9 @@ if uploaded_file:
                     f"{final_size_mb:.1f} MB"
                 )
 
-            # ======================================
+            # ==========================================
             # DOWNLOAD
-            # ======================================
+            # ==========================================
 
             st.subheader(
                 "⬇️ Download"
@@ -1312,10 +1399,9 @@ if uploaded_file:
                 )
 
             st.info(
-                "Original PPT ke slide layouts, positions "
-                "aur slide XML ko modify nahi kiya gaya. "
-                "Sirf supported raster images ko AI-edited "
-                "images se replace kiya gaya hai."
+                "Slide layout aur slide XML ko modify nahi kiya gaya. "
+                "Sirf supported raster images ko AI-edited images "
+                "se replace kiya gaya hai."
             )
 
         except Exception as e:
