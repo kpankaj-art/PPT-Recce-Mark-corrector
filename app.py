@@ -12,7 +12,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 st.set_page_config(
-    page_title="PPT Recce Mark Corrector V7.1",
+    page_title="PPT Recce Mark Corrector V7.2",
     page_icon="🟩",
     layout="wide"
 )
@@ -518,6 +518,62 @@ def find_black_rectangle(bgr):
 
     if best is None:
         return None, None
+
+    # V7.2 targeted false-positive guard.
+    #
+    # In the remaining bad case, the detector selected a very wide
+    # horizontal storefront/door region. The whole inside of that
+    # candidate was already dark, unlike a hand-drawn outline where
+    # most of the inside remains the actual photo.
+    #
+    # Only reject this very specific pattern. Do NOT use a global
+    # roughness filter because V7's other black-marker cases depend
+    # on the existing V7 behavior.
+    bx1, by1, bx2, by2 = best[1]
+
+    bw = max(1, bx2 - bx1)
+    bh = max(1, by2 - by1)
+
+    candidate = dark[
+        by1:by2 + 1,
+        bx1:bx2 + 1
+    ]
+
+    if candidate.size > 0:
+        inner_pad = max(
+            3,
+            min(
+                18,
+                int(min(bw, bh) * 0.10)
+            )
+        )
+
+        if (
+            candidate.shape[0] > inner_pad * 2
+            and
+            candidate.shape[1] > inner_pad * 2
+        ):
+            inner = candidate[
+                inner_pad:-inner_pad,
+                inner_pad:-inner_pad
+            ]
+
+            inner_dark_ratio = float(
+                inner.mean()
+            )
+
+            aspect_ratio = (
+                bw / max(1, bh)
+            )
+
+            # Specific protection for wide, mostly-dark
+            # architectural regions.
+            if (
+                aspect_ratio >= 3.0
+                and
+                inner_dark_ratio >= 0.38
+            ):
+                return None, None
 
     return (
         best[1],
@@ -1788,7 +1844,7 @@ def build_final_ppt(
 # ============================================================
 
 st.title(
-    "🟩 PPT Recce Mark Corrector V7.1"
+    "🟩 PPT Recce Mark Corrector V7.2"
 )
 
 st.write(
