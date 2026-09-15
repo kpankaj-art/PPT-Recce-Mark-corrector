@@ -717,6 +717,363 @@ def black_marker_mask(
 
 
 # ============================================================
+# V7 FALLBACK: OTHER COLORS
+# ============================================================
+
+def detect_other_color_marker(bgr):
+    """
+    Color-independent fallback.
+
+    This is intentionally used ONLY when the normal green detector
+    did not find a marker. It looks for a saturated, thin,
+    rectangle-like colored stroke regardless of hue:
+    red/blue/yellow/orange/purple/etc.
+
+    Large filled colorful signs are rejected by the thin
+    top-hat + four-side geometry checks.
+    """
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+
+    # Ignore near-grey pixels. This detector is for colors other
+    # than the already-handled green/black.
+    color_pixels = cv2.inRange(
+        hsv,
+        np.array([0, 105, 45], dtype=np.uint8),
+        np.array([179, 255, 255], dtype=np.uint8)
+    )
+
+    # Remove green from the generic fallback so normal green
+    # handling remains authoritative.
+    green = cv2.inRange(
+        hsv,
+        np.array([38, 75, 45], dtype=np.uint8),
+        np.array([88, 255, 255], dtype=np.uint8)
+    )
+
+    color_pixels = cv2.bitwise_and(
+        color_pixels,
+        cv2.bitwise_not(green)
+    )
+
+    # Thin colored strokes survive top-hat better than large
+    # filled signs/cloth.
+    thin = cv2.morphologyEx(
+        color_pixels,
+        cv2.MORPH_TOPHAT,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (31, 31)
+        )
+    )
+
+    thin = cv2.morphologyEx(
+        thin,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (5, 5)
+        ),
+        iterations=1
+    )
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        thin,
+        8
+    )
+
+    H, W = thin.shape
+    image_area = H * W
+    boxes = []
+    result = np.zeros_like(thin)
+
+    for i in range(1, n):
+
+        x, y, w, h, area = map(
+            int,
+            stats[i]
+        )
+
+        if area < max(
+            4500,
+            int(image_area * 0.0025)
+        ):
+            continue
+
+        if w < 80 or h < 55:
+            continue
+
+        if w > W * 0.90 or h > H * 0.90:
+            continue
+
+        if y > H * 0.75:
+            continue
+
+        fill = area / max(
+            1,
+            w * h
+        )
+
+        if fill > 0.34:
+            continue
+
+        if x <= 1 or y <= 1:
+            continue
+
+        if x + w >= W - 1 or y + h >= H - 1:
+            continue
+
+        component = np.where(
+            labels == i,
+            255,
+            0
+        ).astype(np.uint8)
+
+        # Side support.
+        band = max(
+            2,
+            int(min(w, h) * 0.035)
+        )
+
+        crop = component
+
+        top_cov = crop[:band, :].mean() / 255.0
+        bottom_cov = crop[-band:, :].mean() / 255.0
+        left_cov = crop[:, :band].mean() / 255.0
+        right_cov = crop[:, -band:].mean() / 255.0
+
+        sides = [
+            top_cov,
+            bottom_cov,
+            left_cov,
+            right_cov
+        ]
+
+        strong = sum(
+            v >= 0.10
+            for v in sides
+        )
+
+        if strong < 3:
+            continue
+
+        # Check contour is outline-like, not a filled object.
+        contours, _ = cv2.findContours(
+            component,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE
+        )
+
+        if not contours:
+            continue
+
+        contour = max(
+            contours,
+            key=cv2.contourArea
+        )
+
+        perimeter = cv2.arcLength(
+            contour,
+            True
+        )
+
+        if perimeter <= 0:
+            continue
+
+        approx = cv2.approxPolyDP(
+            contour,
+            0.03 * perimeter,
+            True
+        )
+
+        if len(approx) < 4 or len(approx) > 14:
+            continue
+
+        result = cv2.bitwise_or(
+            result,
+            component
+        )
+
+        boxes.append(
+            (
+                x,
+                y,
+                w,
+                h
+            )
+        )
+
+    return result, boxes
+
+
+# ============================================================
+# V7 FALLBACK: BLACK MARKER MERGED WITH ORIGINAL BORDER
+# ============================================================
+
+def black_side_band_fallback(
+    bgr,
+    rectangle
+):
+    """
+    Handles the difficult case where the rough black marking
+    touches/merges with an existing black sign border.
+
+    V6 correctly found the rectangle geometry but then rejected
+    the connected component because it was merged with the sign.
+    V7 therefore removes ONLY dark pixels in narrow bands around
+    the four detected marker sides.
+
+    The center of the rectangle is never erased.
+    """
+
+    if rectangle is None:
+        return (
+            np.zeros(
+                bgr.shape[:2],
+                dtype=np.uint8
+            ),
+            False
+        )
+
+    gray = cv2.cvtColor(
+        bgr,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    H, W = gray.shape
+
+    x1, y1, x2, y2 = rectangle
+
+    width = max(
+        1,
+        x2 - x1
+    )
+
+    height = max(
+        1,
+        y2 - y1
+    )
+
+    # Narrow marker band. It is deliberately much smaller than
+    # the previous V2/V3 bounding-box erase.
+    band = max(
+        3,
+        min(
+            10,
+            int(min(width, height) * 0.018)
+        )
+    )
+
+    mask = np.zeros(
+        (H, W),
+        dtype=np.uint8
+    )
+
+    # Four narrow bands around the detected rough rectangle.
+    # We keep only genuinely dark pixels from those bands.
+    def add_dark_band(xa, ya, xb, yb):
+        xa = max(0, xa)
+        ya = max(0, ya)
+        xb = min(W, xb)
+        yb = min(H, yb)
+
+        if xb <= xa or yb <= ya:
+            return
+
+        local = (
+            gray[ya:yb, xa:xb] < 65
+        ).astype(np.uint8) * 255
+
+        mask[ya:yb, xa:xb] = cv2.bitwise_or(
+            mask[ya:yb, xa:xb],
+            local
+        )
+
+    add_dark_band(
+        x1,
+        y1 - band,
+        x2 + 1,
+        y1 + band + 1
+    )
+
+    add_dark_band(
+        x1,
+        y2 - band,
+        x2 + 1,
+        y2 + band + 1
+    )
+
+    add_dark_band(
+        x1 - band,
+        y1,
+        x1 + band + 1,
+        y2 + 1
+    )
+
+    add_dark_band(
+        x2 - band,
+        y1,
+        x2 + band + 1,
+        y2 + 1
+    )
+
+    # The black stroke should have meaningful support on at least
+    # three sides.
+    sides = [
+        mask[
+            max(0, y1-band):
+            min(H, y1+band+1),
+            x1:x2+1
+        ].mean() / 255.0,
+
+        mask[
+            max(0, y2-band):
+            min(H, y2+band+1),
+            x1:x2+1
+        ].mean() / 255.0,
+
+        mask[
+            y1:y2+1,
+            max(0, x1-band):
+            min(W, x1+band+1)
+        ].mean() / 255.0,
+
+        mask[
+            y1:y2+1,
+            max(0, x2-band):
+            min(W, x2+band+1)
+        ].mean() / 255.0
+    ]
+
+    if sum(
+        s >= 0.025
+        for s in sides
+    ) < 3:
+        return (
+            np.zeros(
+                (H, W),
+                dtype=np.uint8
+            ),
+            False
+        )
+
+    # Small dilation only for anti-aliased edges.
+    mask = cv2.dilate(
+        mask,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (3, 3)
+        ),
+        iterations=1
+    )
+
+    return mask, True
+
+
+# ============================================================
 # COMBINED DETECTION
 # ============================================================
 
@@ -724,13 +1081,26 @@ def detect_markings(
     bgr,
     mode
 ):
+    """
+    V7 priority:
+
+    1. Existing V6 green detector.
+    2. If no green:
+       - Black detector + V7 merged-border fallback.
+       - Generic other-color detector as last resort.
+
+    Therefore an unmarked image still has to pass a strict
+    geometry test before anything is changed.
+    """
 
     green_pixels, green_boxes = (
         detect_green_markers(bgr)
     )
 
-    # If user explicitly selects Green,
-    # never run black detection.
+    # --------------------------------------------------------
+    # GREEN
+    # --------------------------------------------------------
+
     if mode == "Green":
 
         if not green_boxes:
@@ -750,14 +1120,10 @@ def detect_markings(
 
         for x, y, w, h in green_boxes:
 
-            component = cv2.inRange(
-                green_pixels[
-                    y:y+h,
-                    x:x+w
-                ],
-                1,
-                255
-            )
+            comp = green_pixels[
+                y:y+h,
+                x:x+w
+            ]
 
             full = np.zeros_like(
                 mask
@@ -766,7 +1132,7 @@ def detect_markings(
             full[
                 y:y+h,
                 x:x+w
-            ] = component
+            ] = comp
 
             mask = cv2.bitwise_or(
                 mask,
@@ -779,11 +1145,7 @@ def detect_markings(
             True
         )
 
-    # For AUTO:
-    # If a confident green marker exists, use ONLY those
-    # green markers. Do not run black detector on the same
-    # image because dark photo structures can create false
-    # positives.
+    # AUTO: green has priority.
     if mode == "Auto" and green_boxes:
 
         mask = np.zeros(
@@ -818,51 +1180,99 @@ def detect_markings(
             True
         )
 
-    # Black mode or AUTO with no green marker.
+    # --------------------------------------------------------
+    # BLACK
+    # --------------------------------------------------------
+
     rectangle, _ = find_black_rectangle(
         bgr
     )
 
-    if rectangle is None:
-        return (
-            np.zeros(
-                bgr.shape[:2],
-                dtype=np.uint8
-            ),
-            [],
-            False
+    if rectangle is not None:
+
+        black_mask, found = (
+            black_marker_mask(
+                bgr,
+                rectangle
+            )
         )
 
-    black_mask, found = (
-        black_marker_mask(
-            bgr,
-            rectangle
+        if found:
+
+            x1, y1, x2, y2 = rectangle
+
+            return (
+                black_mask,
+                [
+                    (
+                        x1,
+                        y1,
+                        x2-x1,
+                        y2-y1
+                    )
+                ],
+                True
+            )
+
+        # V7: difficult black marker touching original black
+        # border. Use side-band fallback.
+        fallback_mask, fallback_found = (
+            black_side_band_fallback(
+                bgr,
+                rectangle
+            )
+        )
+
+        if fallback_found:
+
+            x1, y1, x2, y2 = rectangle
+
+            return (
+                fallback_mask,
+                [
+                    (
+                        x1,
+                        y1,
+                        x2-x1,
+                        y2-y1
+                    )
+                ],
+                True
+            )
+
+    # --------------------------------------------------------
+    # OTHER COLORS
+    # --------------------------------------------------------
+
+    # Only reach here when green and black failed.
+    # This is deliberately last to minimize false positives.
+    other_mask, other_boxes = (
+        detect_other_color_marker(
+            bgr
         )
     )
 
-    if not found:
+    if other_boxes and np.count_nonzero(
+        other_mask
+    ) >= 100:
+
         return (
-            np.zeros(
-                bgr.shape[:2],
-                dtype=np.uint8
-            ),
-            [],
-            False
+            other_mask,
+            other_boxes,
+            True
         )
 
-    x1, y1, x2, y2 = rectangle
+    # --------------------------------------------------------
+    # NOTHING CONFIDENT
+    # --------------------------------------------------------
 
     return (
-        black_mask,
-        [
-            (
-                x1,
-                y1,
-                x2 - x1,
-                y2 - y1
-            )
-        ],
-        True
+        np.zeros(
+            bgr.shape[:2],
+            dtype=np.uint8
+        ),
+        [],
+        False
     )
 
 
@@ -1387,8 +1797,9 @@ st.write(
 )
 
 st.info(
-    "IMPORTANT: Confident marking na mile to image ko "
-    "bilkul untouched rakha jata hai."
+    "Green/Black ke saath V7 red, blue, yellow, orange jaise "
+    "other-color rough rectangular markings ko bhi detect kar sakta hai. "
+    "Confident marking na mile to image untouched rahegi."
 )
 
 mode = st.selectbox(
