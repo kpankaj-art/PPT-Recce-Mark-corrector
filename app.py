@@ -578,6 +578,17 @@ def process_image(
         lineType=cv2.LINE_AA
     )
 
+    # Save detection information BEFORE deleting the object.
+    # This fixes: "cannot access local variable detection".
+    detection_method = detection["method"]
+    detection_confidence = float(detection["confidence"])
+    detection_bbox = (
+        int(x),
+        int(y),
+        int(w),
+        int(h)
+    )
+
     # Restore alpha if original PNG has transparency.
     result = restore_alpha(
         original,
@@ -600,14 +611,9 @@ def process_image(
 
     return {
         "changed": True,
-        "method": detection["method"],
-        "confidence": detection["confidence"],
-        "bbox": (
-            int(x),
-            int(y),
-            int(w),
-            int(h)
-        )
+        "method": detection_method,
+        "confidence": detection_confidence,
+        "bbox": detection_bbox
     }
 
 
