@@ -525,6 +525,126 @@ def find_black_rectangle(bgr):
     )
 
 
+def rectangle_is_hand_drawn(
+    bgr,
+    rectangle
+):
+    """
+    V8 false-positive protection.
+
+    The remaining V7 errors were clean architectural/sign borders
+    being interpreted as a marker. A real hand-drawn rectangle
+    usually has noticeable side-position variation/irregularity.
+
+    A clean straight border has very low deviation.
+    We therefore require at least two sides to be visibly irregular.
+    """
+
+    gray = cv2.cvtColor(
+        bgr,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    H, W = gray.shape
+    x1, y1, x2, y2 = rectangle
+
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+
+    # Sample a narrow neighborhood around each side.
+    band = max(
+        4,
+        min(
+            14,
+            int(min(width, height) * 0.025)
+        )
+    )
+
+    dark = gray < 70
+
+    def horizontal_variation(y, xa, xb):
+        ys = []
+
+        xa = max(0, xa)
+        xb = min(W - 1, xb)
+
+        for x in range(xa, xb + 1, max(1, width // 100)):
+            lo = max(0, y - band)
+            hi = min(H, y + band + 1)
+            hits = np.where(dark[lo:hi, x])[0]
+
+            if len(hits):
+                ys.append(float(lo + np.median(hits)))
+
+        if len(ys) < 12:
+            return 0.0
+
+        return float(np.std(ys))
+
+    def vertical_variation(x, ya, yb):
+        xs = []
+
+        ya = max(0, ya)
+        yb = min(H - 1, yb)
+
+        for y in range(ya, yb + 1, max(1, height // 100)):
+            lo = max(0, x - band)
+            hi = min(W, x + band + 1)
+            hits = np.where(dark[y, lo:hi])[0]
+
+            if len(hits):
+                xs.append(float(lo + np.median(hits)))
+
+        if len(xs) < 12:
+            return 0.0
+
+        return float(np.std(xs))
+
+    top_v = horizontal_variation(
+        y1, x1, x2
+    )
+
+    bottom_v = horizontal_variation(
+        y2, x1, x2
+    )
+
+    left_v = vertical_variation(
+        x1, y1, y2
+    )
+
+    right_v = vertical_variation(
+        x2, y1, y2
+    )
+
+    variations = [
+        top_v,
+        bottom_v,
+        left_v,
+        right_v
+    ]
+
+    # A hand-drawn line does not need all four sides to be rough.
+    # Two noticeably varying sides is a strong signal.
+    rough_sides = sum(
+        v >= 2.2
+        for v in variations
+    )
+
+    max_variation = max(
+        variations
+    )
+
+    # Extra safety for the typical clean sign/border:
+    # if all sides are extremely straight, reject it.
+    if max_variation < 2.0:
+        return False
+
+    if rough_sides < 2:
+        return False
+
+    return True
+
+
 def black_marker_mask(
     bgr,
     rectangle
@@ -1214,8 +1334,23 @@ def detect_markings(
                 True
             )
 
-        # V7: difficult black marker touching original black
-        # border. Use side-band fallback.
+        # V8 protection:
+        # V7's side-band fallback could mistake a clean storefront
+        # border for a black marker. Only use it when the detected
+        # rectangle has genuine hand-drawn irregularity.
+        if not rectangle_is_hand_drawn(
+            bgr,
+            rectangle
+        ):
+            return (
+                np.zeros(
+                    bgr.shape[:2],
+                    dtype=np.uint8
+                ),
+                [],
+                False
+            )
+
         fallback_mask, fallback_found = (
             black_side_band_fallback(
                 bgr,
@@ -1256,11 +1391,24 @@ def detect_markings(
         other_mask
     ) >= 100:
 
-        return (
-            other_mask,
-            other_boxes,
-            True
-        )
+        # Generic color detection is only accepted when the box
+        # itself looks hand-drawn. This prevents colorful signs,
+        # clothes and shop displays from creating random boxes.
+        valid_boxes = []
+
+        for box in other_boxes:
+            if rectangle_is_hand_drawn(
+                bgr,
+                box
+            ):
+                valid_boxes.append(box)
+
+        if valid_boxes:
+            return (
+                other_mask,
+                valid_boxes,
+                True
+            )
 
     # --------------------------------------------------------
     # NOTHING CONFIDENT
