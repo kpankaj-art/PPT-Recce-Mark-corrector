@@ -2,784 +2,1681 @@
 import streamlit as st
 import cv2
 import numpy as np
+from PIL import Image, ImageFile
 import zipfile
 import tempfile
-import os
 import shutil
 import gc
-import xml.etree.ElementTree as ET
+import os
 from pathlib import Path
-from PIL import Image
-
-
-# ============================================================
-# APP SETTINGS
-# ============================================================
+import xml.etree.ElementTree as ET
 
 st.set_page_config(
-    page_title="PPT Recce Mark Corrector V8.1",
+    page_title="PPT Recce Mark Corrector V7.1",
     page_icon="🟩",
     layout="wide"
 )
 
 MAX_PPT_MB = 300
-MAX_IMAGE_PIXELS = 40_000_000
-CHUNK_SIZE = 1024 * 1024
-
 SUPPORTED = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+Image.MAX_IMAGE_PIXELS = 40_000_000
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# OpenCV works locally; no API key required.
+# Final professional marking color = GREEN
+GREEN = (0, 200, 0)
 
 
-# ============================================================
-# MEMORY
-# ============================================================
-
-def clean_memory():
+def clean_mem():
     gc.collect()
+
+
+# ============================================================
+# GREEN MARKER DETECTION
+# ============================================================
+
+def detect_green_markers(bgr):
+    """
+    V6 green detection.
+
+    The previous version treated natural green storefront/cloth
+    areas as marker boxes. V6 first isolates thin green structures
+    with a top-hat operation and then applies strict marker geometry.
+
+    It deliberately prefers NO DETECTION over a false green box.
+    """
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    green = cv2.inRange(
+        hsv,
+        np.array([38, 85, 55], dtype=np.uint8),
+        np.array([88, 255, 255], dtype=np.uint8)
+    )
+
+    top_hat = cv2.morphologyEx(
+        green,
+        cv2.MORPH_TOPHAT,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (31, 31)
+        )
+    )
+
+    top_hat = cv2.morphologyEx(
+        top_hat,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (5, 5)
+        ),
+        iterations=1
+    )
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        top_hat,
+        8
+    )
+
+    H, W = top_hat.shape
+    image_area = H * W
+    boxes = []
+
+    for i in range(1, n):
+
+        x, y, w, h, area = map(
+            int,
+            stats[i]
+        )
+
+        # Marker must be large enough to be meaningful in a
+        # 720p-1024p recce photo.
+        if area < max(
+            5000,
+            int(image_area * 0.003)
+        ):
+            continue
+
+        if w < 80 or h < 70:
+            continue
+
+        if w > W * 0.90 or h > H * 0.96:
+            continue
+
+        fill = area / max(
+            1,
+            w * h
+        )
+
+        # Filled green objects are not marker outlines.
+        if fill > 0.36:
+            continue
+
+        # Edge-connected large green regions are usually cloth,
+        # plants, awnings, etc.
+        if x <= 1:
+            continue
+
+        if y <= 1:
+            continue
+
+        if x + w >= W - 1:
+            continue
+
+        if y + h >= H - 1:
+            continue
+
+        component = np.where(
+            labels == i,
+            255,
+            0
+        ).astype(np.uint8)
+
+        contours, _ = cv2.findContours(
+            component,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE
+        )
+
+        if not contours:
+            continue
+
+        contour = max(
+            contours,
+            key=cv2.contourArea
+        )
+
+        perimeter = cv2.arcLength(
+            contour,
+            True
+        )
+
+        if perimeter <= 0:
+            continue
+
+        approx = cv2.approxPolyDP(
+            contour,
+            0.03 * perimeter,
+            True
+        )
+
+        vertices = len(approx)
+
+        if vertices < 4 or vertices > 12:
+            continue
+
+        aspect = w / max(
+            1,
+            h
+        )
+
+        band = max(
+            2,
+            int(min(w, h) * 0.035)
+        )
+
+        crop = (
+            component[y:y+h, x:x+w]
+        )
+
+        top_cov = (
+            crop[:band, :].mean() / 255.0
+        )
+
+        bottom_cov = (
+            crop[-band:, :].mean() / 255.0
+        )
+
+        left_cov = (
+            crop[:, :band].mean() / 255.0
+        )
+
+        right_cov = (
+            crop[:, -band:].mean() / 255.0
+        )
+
+        sides = [
+            top_cov,
+            bottom_cov,
+            left_cov,
+            right_cov
+        ]
+
+        strong_sides = sum(
+            s >= 0.12
+            for s in sides
+        )
+
+        # Landscape marker: require at least 3 supported sides.
+        if aspect >= 0.5:
+
+            if strong_sides < 3:
+                continue
+
+        # Tall marker:
+        # vertical recce markings can have broken top/bottom
+        # strokes, so accept two opposite/strong side structures
+        # only when the component is very large and thin.
+        else:
+
+            opposite_vertical = (
+                left_cov >= 0.075
+                and
+                right_cov >= 0.075
+            )
+
+            large_vertical = (
+                area >= max(
+                    10000,
+                    int(image_area * 0.012)
+                )
+                and
+                h >= W * 0.45
+            )
+
+            if not (
+                (strong_sides >= 3)
+                or
+                (
+                    opposite_vertical
+                    and
+                    large_vertical
+                )
+            ):
+                continue
+
+        boxes.append(
+            (
+                int(x),
+                int(y),
+                int(w),
+                int(h)
+            )
+        )
+
+    return top_hat, boxes
+
+
+# ============================================================
+# BLACK MARKER DETECTION
+# ============================================================
+
+def _max_run(arr):
+    best = 0
+    current = 0
+
+    for value in arr:
+        if value:
+            current += 1
+            if current > best:
+                best = current
+        else:
+            current = 0
+
+    return best
+
+
+def _clusters(values, gap=4):
+    if not values:
+        return []
+
+    groups = []
+    current = [values[0]]
+
+    for value in values[1:]:
+
+        if value - current[-1] <= gap:
+            current.append(value)
+        else:
+            groups.append(current)
+            current = [value]
+
+    groups.append(current)
+
+    return [
+        int(np.mean(group))
+        for group in groups
+    ]
+
+
+def find_black_rectangle(bgr):
+    """
+    Finds the rough black rectangular marking.
+
+    V5 change:
+    Instead of asking "are there black pixels?",
+    we look for FOUR sides that form a rectangle:
+      top + bottom + left + right.
+
+    This is much safer on storefront photos.
+    """
+
+    gray = cv2.cvtColor(
+        bgr,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    H, W = gray.shape
+
+    # Pure/dark black. The rough marker is much darker than
+    # most brown/grey storefront structures.
+    dark = (
+        gray < 50
+    ).astype(np.uint8)
+
+    y_start = int(H * 0.03)
+    y_end = int(H * 0.72)
+
+    x_start = int(W * 0.03)
+    x_end = int(W * 0.97)
+
+    row_values = []
+
+    for y in range(
+        y_start,
+        y_end
+    ):
+
+        run = _max_run(
+            dark[y, x_start:x_end]
+        )
+
+        if run >= max(
+            25,
+            int(W * 0.07)
+        ):
+
+            row_values.append(y)
+
+    col_values = []
+
+    for x in range(
+        x_start,
+        x_end
+    ):
+
+        run = _max_run(
+            dark[y_start:y_end, x]
+        )
+
+        if run >= max(
+            25,
+            int(H * 0.07)
+        ):
+
+            col_values.append(x)
+
+    rows = _clusters(
+        row_values,
+        gap=4
+    )
+
+    cols = _clusters(
+        col_values,
+        gap=4
+    )
+
+    if len(rows) < 2 or len(cols) < 2:
+        return None, None
+
+    best = None
+
+    # Try possible rectangle boundaries.
+    for top in rows:
+
+        for bottom in rows:
+
+            if bottom <= top:
+                continue
+
+            rect_h = bottom - top
+
+            if rect_h < H * 0.08:
+                continue
+
+            if rect_h > H * 0.55:
+                continue
+
+            for left in cols:
+
+                for right in cols:
+
+                    if right <= left:
+                        continue
+
+                    rect_w = right - left
+
+                    if rect_w < W * 0.12:
+                        continue
+
+                    if rect_w > W * 0.90:
+                        continue
+
+                    band = max(
+                        2,
+                        int(min(W, H) * 0.012)
+                    )
+
+                    x1 = max(
+                        0,
+                        left - band
+                    )
+
+                    x2 = min(
+                        W,
+                        right + band + 1
+                    )
+
+                    y1 = max(
+                        0,
+                        top - band
+                    )
+
+                    y2 = min(
+                        H,
+                        bottom + band + 1
+                    )
+
+                    top_cov = dark[
+                        y1:y2,
+                        x1:x2
+                    ]
+
+                    # Side-specific support.
+                    top_support = dark[
+                        y1:y2,
+                        left:right + 1
+                    ].mean()
+
+                    bottom_support = dark[
+                        max(0, bottom - band):
+                        min(H, bottom + band + 1),
+                        left:right + 1
+                    ].mean()
+
+                    left_support = dark[
+                        top:bottom + 1,
+                        x1:x2
+                    ].mean()
+
+                    right_support = dark[
+                        top:bottom + 1,
+                        max(0, right - band):
+                        min(W, right + band + 1)
+                    ].mean()
+
+                    supports = [
+                        top_support,
+                        bottom_support,
+                        left_support,
+                        right_support
+                    ]
+
+                    if min(supports) < 0.035:
+                        continue
+
+                    avg_support = float(
+                        np.mean(supports)
+                    )
+
+                    # A genuine rough rectangle has four
+                    # reasonably strong sides.
+                    strong = sum(
+                        s >= 0.07
+                        for s in supports
+                    )
+
+                    if strong < 3:
+                        continue
+
+                    # Prefer larger, stronger rectangles.
+                    size_score = (
+                        (rect_w / W) *
+                        (rect_h / H)
+                    )
+
+                    score = (
+                        avg_support * 0.75
+                        +
+                        size_score * 0.25
+                    )
+
+                    if (
+                        best is None
+                        or score > best[0]
+                    ):
+
+                        best = (
+                            score,
+                            (
+                                int(left),
+                                int(top),
+                                int(right),
+                                int(bottom)
+                            ),
+                            supports
+                        )
+
+    if best is None:
+        return None, None
+
+    return (
+        best[1],
+        dark
+    )
+
+
+def black_marker_mask(
+    bgr,
+    rectangle
+):
+    """
+    V6 black marker cleanup.
+
+    A normal dark storefront frame/sign is rejected.
+    The old rough marker is accepted only when its dark component
+    has the irregular geometry expected from a hand-drawn outline.
+    """
+
+    gray = cv2.cvtColor(
+        bgr,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    H, W = gray.shape
+
+    dark = (
+        gray < 55
+    ).astype(np.uint8)
+
+    n, labels, stats, _ = (
+        cv2.connectedComponentsWithStats(
+            dark,
+            8
+        )
+    )
+
+    rx1, ry1, rx2, ry2 = rectangle
+
+    pad_x = max(
+        15,
+        int((rx2 - rx1) * 0.08)
+    )
+
+    pad_y = max(
+        15,
+        int((ry2 - ry1) * 0.08)
+    )
+
+    ex1 = max(
+        0,
+        rx1 - pad_x
+    )
+
+    ey1 = max(
+        0,
+        ry1 - pad_y
+    )
+
+    ex2 = min(
+        W - 1,
+        rx2 + pad_x
+    )
+
+    ey2 = min(
+        H - 1,
+        ry2 + pad_y
+    )
+
+    mask = np.zeros_like(
+        dark,
+        dtype=np.uint8
+    )
+
+    main_found = False
+
+    for i in range(1, n):
+
+        x, y, w, h, area = map(
+            int,
+            stats[i]
+        )
+
+        if area < 1500:
+            continue
+
+        fill = area / max(
+            1,
+            w * h
+        )
+
+        if fill > 0.20:
+            continue
+
+        component = np.where(
+            labels == i,
+            255,
+            0
+        ).astype(np.uint8)
+
+        contours, _ = cv2.findContours(
+            component,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE
+        )
+
+        if not contours:
+            continue
+
+        contour = max(
+            contours,
+            key=cv2.contourArea
+        )
+
+        perimeter = cv2.arcLength(
+            contour,
+            True
+        )
+
+        if perimeter <= 0:
+            continue
+
+        approx = cv2.approxPolyDP(
+            contour,
+            0.02 * perimeter,
+            True
+        )
+
+        vertices = len(approx)
+
+        rect = cv2.minAreaRect(
+            contour
+        )
+
+        rw, rh = rect[1]
+
+        rect_area = max(
+            1.0,
+            rw * rh
+        )
+
+        contour_area = max(
+            1.0,
+            cv2.contourArea(contour)
+        )
+
+        shape_ratio = (
+            contour_area /
+            rect_area
+        )
+
+        # Rough marker:
+        # irregular enough (5+ vertices) and occupies a
+        # meaningful portion of its minimum rectangle.
+        rough_shape = (
+            5 <= vertices <= 12
+            and
+            shape_ratio >= 0.25
+        )
+
+        intersects = not (
+            x + w < ex1
+            or x > ex2
+            or y + h < ey1
+            or y > ey2
+        )
+
+        if rough_shape and intersects:
+
+            mask = cv2.bitwise_or(
+                mask,
+                component
+            )
+
+            main_found = True
+
+    if not main_found:
+        return (
+            np.zeros_like(dark),
+            False
+        )
+
+    # Cover the actual black stroke only.
+    mask = cv2.dilate(
+        mask,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (7, 7)
+        ),
+        iterations=1
+    )
+
+    return (
+        mask,
+        True
+    )
+
+
+# ============================================================
+# V7 FALLBACK: OTHER COLORS
+# ============================================================
+
+def detect_other_color_marker(bgr):
+    """
+    Color-independent fallback.
+
+    This is intentionally used ONLY when the normal green detector
+    did not find a marker. It looks for a saturated, thin,
+    rectangle-like colored stroke regardless of hue:
+    red/blue/yellow/orange/purple/etc.
+
+    Large filled colorful signs are rejected by the thin
+    top-hat + four-side geometry checks.
+    """
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+
+    # Ignore near-grey pixels. This detector is for colors other
+    # than the already-handled green/black.
+    color_pixels = cv2.inRange(
+        hsv,
+        np.array([0, 105, 45], dtype=np.uint8),
+        np.array([179, 255, 255], dtype=np.uint8)
+    )
+
+    # Remove green from the generic fallback so normal green
+    # handling remains authoritative.
+    green = cv2.inRange(
+        hsv,
+        np.array([38, 75, 45], dtype=np.uint8),
+        np.array([88, 255, 255], dtype=np.uint8)
+    )
+
+    color_pixels = cv2.bitwise_and(
+        color_pixels,
+        cv2.bitwise_not(green)
+    )
+
+    # Thin colored strokes survive top-hat better than large
+    # filled signs/cloth.
+    thin = cv2.morphologyEx(
+        color_pixels,
+        cv2.MORPH_TOPHAT,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (31, 31)
+        )
+    )
+
+    thin = cv2.morphologyEx(
+        thin,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (5, 5)
+        ),
+        iterations=1
+    )
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        thin,
+        8
+    )
+
+    H, W = thin.shape
+    image_area = H * W
+    boxes = []
+    result = np.zeros_like(thin)
+
+    for i in range(1, n):
+
+        x, y, w, h, area = map(
+            int,
+            stats[i]
+        )
+
+        if area < max(
+            4500,
+            int(image_area * 0.0025)
+        ):
+            continue
+
+        if w < 80 or h < 55:
+            continue
+
+        if w > W * 0.90 or h > H * 0.90:
+            continue
+
+        if y > H * 0.75:
+            continue
+
+        fill = area / max(
+            1,
+            w * h
+        )
+
+        if fill > 0.34:
+            continue
+
+        if x <= 1 or y <= 1:
+            continue
+
+        if x + w >= W - 1 or y + h >= H - 1:
+            continue
+
+        component = np.where(
+            labels == i,
+            255,
+            0
+        ).astype(np.uint8)
+
+        # Side support.
+        band = max(
+            2,
+            int(min(w, h) * 0.035)
+        )
+
+        crop = component
+
+        top_cov = crop[:band, :].mean() / 255.0
+        bottom_cov = crop[-band:, :].mean() / 255.0
+        left_cov = crop[:, :band].mean() / 255.0
+        right_cov = crop[:, -band:].mean() / 255.0
+
+        sides = [
+            top_cov,
+            bottom_cov,
+            left_cov,
+            right_cov
+        ]
+
+        strong = sum(
+            v >= 0.10
+            for v in sides
+        )
+
+        if strong < 3:
+            continue
+
+        # Check contour is outline-like, not a filled object.
+        contours, _ = cv2.findContours(
+            component,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE
+        )
+
+        if not contours:
+            continue
+
+        contour = max(
+            contours,
+            key=cv2.contourArea
+        )
+
+        perimeter = cv2.arcLength(
+            contour,
+            True
+        )
+
+        if perimeter <= 0:
+            continue
+
+        approx = cv2.approxPolyDP(
+            contour,
+            0.03 * perimeter,
+            True
+        )
+
+        if len(approx) < 4 or len(approx) > 14:
+            continue
+
+        result = cv2.bitwise_or(
+            result,
+            component
+        )
+
+        boxes.append(
+            (
+                x,
+                y,
+                w,
+                h
+            )
+        )
+
+    return result, boxes
+
+
+# ============================================================
+# V7 FALLBACK: BLACK MARKER MERGED WITH ORIGINAL BORDER
+# ============================================================
+
+def black_side_band_fallback(
+    bgr,
+    rectangle
+):
+    """
+    Handles the difficult case where the rough black marking
+    touches/merges with an existing black sign border.
+
+    V6 correctly found the rectangle geometry but then rejected
+    the connected component because it was merged with the sign.
+    V7 therefore removes ONLY dark pixels in narrow bands around
+    the four detected marker sides.
+
+    The center of the rectangle is never erased.
+    """
+
+    if rectangle is None:
+        return (
+            np.zeros(
+                bgr.shape[:2],
+                dtype=np.uint8
+            ),
+            False
+        )
+
+    gray = cv2.cvtColor(
+        bgr,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    H, W = gray.shape
+
+    x1, y1, x2, y2 = rectangle
+
+    width = max(
+        1,
+        x2 - x1
+    )
+
+    height = max(
+        1,
+        y2 - y1
+    )
+
+    # Narrow marker band. It is deliberately much smaller than
+    # the previous V2/V3 bounding-box erase.
+    band = max(
+        3,
+        min(
+            10,
+            int(min(width, height) * 0.018)
+        )
+    )
+
+    mask = np.zeros(
+        (H, W),
+        dtype=np.uint8
+    )
+
+    # Four narrow bands around the detected rough rectangle.
+    # We keep only genuinely dark pixels from those bands.
+    def add_dark_band(xa, ya, xb, yb):
+        xa = max(0, xa)
+        ya = max(0, ya)
+        xb = min(W, xb)
+        yb = min(H, yb)
+
+        if xb <= xa or yb <= ya:
+            return
+
+        local = (
+            gray[ya:yb, xa:xb] < 65
+        ).astype(np.uint8) * 255
+
+        mask[ya:yb, xa:xb] = cv2.bitwise_or(
+            mask[ya:yb, xa:xb],
+            local
+        )
+
+    add_dark_band(
+        x1,
+        y1 - band,
+        x2 + 1,
+        y1 + band + 1
+    )
+
+    add_dark_band(
+        x1,
+        y2 - band,
+        x2 + 1,
+        y2 + band + 1
+    )
+
+    add_dark_band(
+        x1 - band,
+        y1,
+        x1 + band + 1,
+        y2 + 1
+    )
+
+    add_dark_band(
+        x2 - band,
+        y1,
+        x2 + band + 1,
+        y2 + 1
+    )
+
+    # The black stroke should have meaningful support on at least
+    # three sides.
+    sides = [
+        mask[
+            max(0, y1-band):
+            min(H, y1+band+1),
+            x1:x2+1
+        ].mean() / 255.0,
+
+        mask[
+            max(0, y2-band):
+            min(H, y2+band+1),
+            x1:x2+1
+        ].mean() / 255.0,
+
+        mask[
+            y1:y2+1,
+            max(0, x1-band):
+            min(W, x1+band+1)
+        ].mean() / 255.0,
+
+        mask[
+            y1:y2+1,
+            max(0, x2-band):
+            min(W, x2+band+1)
+        ].mean() / 255.0
+    ]
+
+    if sum(
+        s >= 0.025
+        for s in sides
+    ) < 3:
+        return (
+            np.zeros(
+                (H, W),
+                dtype=np.uint8
+            ),
+            False
+        )
+
+    # Small dilation only for anti-aliased edges.
+    mask = cv2.dilate(
+        mask,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (3, 3)
+        ),
+        iterations=1
+    )
+
+    return mask, True
+
+
+# ============================================================
+# COMBINED DETECTION
+# ============================================================
+
+def detect_markings(
+    bgr,
+    mode
+):
+    """
+    V7 priority:
+
+    1. Existing V6 green detector.
+    2. If no green:
+       - Black detector + V7 merged-border fallback.
+       - Generic other-color detector as last resort.
+
+    Therefore an unmarked image still has to pass a strict
+    geometry test before anything is changed.
+    """
+
+    green_pixels, green_boxes = (
+        detect_green_markers(bgr)
+    )
+
+    # --------------------------------------------------------
+    # GREEN
+    # --------------------------------------------------------
+
+    if mode == "Green":
+
+        if not green_boxes:
+            return (
+                np.zeros(
+                    bgr.shape[:2],
+                    dtype=np.uint8
+                ),
+                [],
+                False
+            )
+
+        mask = np.zeros(
+            bgr.shape[:2],
+            dtype=np.uint8
+        )
+
+        for x, y, w, h in green_boxes:
+
+            comp = green_pixels[
+                y:y+h,
+                x:x+w
+            ]
+
+            full = np.zeros_like(
+                mask
+            )
+
+            full[
+                y:y+h,
+                x:x+w
+            ] = comp
+
+            mask = cv2.bitwise_or(
+                mask,
+                full
+            )
+
+        return (
+            mask,
+            green_boxes,
+            True
+        )
+
+    # AUTO: green has priority.
+    if mode == "Auto" and green_boxes:
+
+        mask = np.zeros(
+            bgr.shape[:2],
+            dtype=np.uint8
+        )
+
+        for x, y, w, h in green_boxes:
+
+            comp = green_pixels[
+                y:y+h,
+                x:x+w
+            ]
+
+            full = np.zeros_like(
+                mask
+            )
+
+            full[
+                y:y+h,
+                x:x+w
+            ] = comp
+
+            mask = cv2.bitwise_or(
+                mask,
+                full
+            )
+
+        return (
+            mask,
+            green_boxes,
+            True
+        )
+
+    # --------------------------------------------------------
+    # BLACK
+    # --------------------------------------------------------
+
+    rectangle, _ = find_black_rectangle(
+        bgr
+    )
+
+    if rectangle is not None:
+
+        black_mask, found = (
+            black_marker_mask(
+                bgr,
+                rectangle
+            )
+        )
+
+        if found:
+
+            x1, y1, x2, y2 = rectangle
+
+            return (
+                black_mask,
+                [
+                    (
+                        x1,
+                        y1,
+                        x2-x1,
+                        y2-y1
+                    )
+                ],
+                True
+            )
+
+        # V7: difficult black marker touching original black
+        # border. Use side-band fallback.
+        fallback_mask, fallback_found = (
+            black_side_band_fallback(
+                bgr,
+                rectangle
+            )
+        )
+
+        if fallback_found:
+
+            x1, y1, x2, y2 = rectangle
+
+            return (
+                fallback_mask,
+                [
+                    (
+                        x1,
+                        y1,
+                        x2-x1,
+                        y2-y1
+                    )
+                ],
+                True
+            )
+
+    # --------------------------------------------------------
+    # OTHER COLORS
+    # --------------------------------------------------------
+
+    # Only reach here when green and black failed.
+    # This is deliberately last to minimize false positives.
+    other_mask, other_boxes = (
+        detect_other_color_marker(
+            bgr
+        )
+    )
+
+    if other_boxes and np.count_nonzero(
+        other_mask
+    ) >= 100:
+
+        return (
+            other_mask,
+            other_boxes,
+            True
+        )
+
+    # --------------------------------------------------------
+    # NOTHING CONFIDENT
+    # --------------------------------------------------------
+
+    return (
+        np.zeros(
+            bgr.shape[:2],
+            dtype=np.uint8
+        ),
+        [],
+        False
+    )
+
+
+# ============================================================
+# REPAIR
+# ============================================================
+
+def repair_image(
+    pil_image,
+    mode="Auto",
+    thickness=4
+):
+
+    rgb = np.asarray(
+        pil_image.convert("RGB")
+    )
+
+    bgr = cv2.cvtColor(
+        rgb,
+        cv2.COLOR_RGB2BGR
+    )
+
+    mask, boxes, found = (
+        detect_markings(
+            bgr,
+            mode
+        )
+    )
+
+    if not found:
+        # IMPORTANT:
+        # No confident marking = untouched image.
+        result = pil_image.convert(
+            "RGB"
+        )
+
+        del rgb, bgr, mask
+        clean_mem()
+
+        return (
+            result,
+            False
+        )
+
+    # Very small radius reduces color bleeding/blue artifacts.
+    repaired = cv2.inpaint(
+        bgr,
+        mask,
+        3,
+        cv2.INPAINT_TELEA
+    )
+
+    H, W = repaired.shape[:2]
+
+    for x, y, w, h in boxes:
+
+        px = max(
+            2,
+            int(w * 0.006)
+        )
+
+        py = max(
+            2,
+            int(h * 0.006)
+        )
+
+        x1 = max(
+            0,
+            x - px
+        )
+
+        y1 = max(
+            0,
+            y - py
+        )
+
+        x2 = min(
+            W - 1,
+            x + w + px
+        )
+
+        y2 = min(
+            H - 1,
+            y + h + py
+        )
+
+        # FINAL PROFESSIONAL MARKING = GREEN
+        cv2.rectangle(
+            repaired,
+            (x1, y1),
+            (x2, y2),
+            GREEN,
+            thickness=max(
+                2,
+                thickness
+            ),
+            lineType=cv2.LINE_AA
+        )
+
+    result = Image.fromarray(
+        cv2.cvtColor(
+            repaired,
+            cv2.COLOR_BGR2RGB
+        )
+    )
+
+    del rgb, bgr, mask, repaired
+    clean_mem()
+
+    return (
+        result,
+        True
+    )
 
 
 # ============================================================
 # PPT MEDIA REFERENCES
 # ============================================================
 
-def get_slide_media_references(ppt_path):
-    """
-    Finds raster images actually referenced by slides.
-    Does not load the whole PPT into memory.
-    """
-    media_paths = set()
+def get_slide_media_references(
+    ppt_path
+):
 
-    with zipfile.ZipFile(ppt_path, "r") as z:
-        names = set(z.namelist())
+    media = set()
+
+    with zipfile.ZipFile(
+        ppt_path,
+        "r"
+    ) as z:
+
+        names = set(
+            z.namelist()
+        )
 
         for rels_name in names:
-            if not rels_name.startswith("ppt/slides/_rels/"):
+
+            if not rels_name.startswith(
+                "ppt/slides/_rels/"
+            ):
                 continue
-            if not rels_name.endswith(".rels"):
+
+            if not rels_name.endswith(
+                ".rels"
+            ):
                 continue
 
             try:
-                root = ET.fromstring(z.read(rels_name))
+
+                root = ET.fromstring(
+                    z.read(
+                        rels_name
+                    )
+                )
+
             except Exception:
                 continue
 
-            rel_map = {}
+            relmap = {}
 
             for rel in root:
-                rid = rel.attrib.get("Id")
-                target = rel.attrib.get("Target")
 
-                if not rid or not target:
-                    continue
+                rid = rel.attrib.get(
+                    "Id"
+                )
 
-                # Handle ../media/image1.png
-                if "../media/" in target:
-                    filename = target.split("../media/", 1)[1]
-                    rel_map[rid] = "ppt/media/" + filename
+                target = rel.attrib.get(
+                    "Target",
+                    ""
+                )
 
-            rel_filename = Path(rels_name).name
-            slide_filename = rel_filename[:-5]
-            slide_xml = "ppt/slides/" + slide_filename
+                if (
+                    rid
+                    and
+                    "../media/" in target
+                ):
+
+                    relmap[rid] = (
+                        "ppt/media/"
+                        +
+                        target.split(
+                            "../media/"
+                        )[-1]
+                    )
+
+            slide_name = Path(
+                rels_name
+            ).name[:-5]
+
+            slide_xml = (
+                "ppt/slides/"
+                +
+                slide_name
+            )
 
             if slide_xml not in names:
                 continue
 
             try:
-                slide_root = ET.fromstring(z.read(slide_xml))
+
+                root = ET.fromstring(
+                    z.read(
+                        slide_xml
+                    )
+                )
+
             except Exception:
                 continue
 
-            for element in slide_root.iter():
-                for attr_name, attr_value in element.attrib.items():
-                    if attr_name.endswith("}embed"):
-                        if attr_value in rel_map:
-                            media_paths.add(rel_map[attr_value])
+            for element in root.iter():
 
-    return sorted(media_paths)
+                for attr, value in (
+                    element.attrib.items()
+                ):
+
+                    if (
+                        attr.endswith(
+                            "}embed"
+                        )
+                        and
+                        value in relmap
+                    ):
+
+                        media.add(
+                            relmap[value]
+                        )
+
+    return sorted(
+        media
+    )
 
 
 # ============================================================
-# IMAGE HELPERS
+# PROCESS ONE IMAGE
 # ============================================================
 
-def read_image_from_file(path):
-    """
-    Reads one image only.
-    Keeps alpha if PNG has alpha.
-    """
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-
-    if img is None:
-        raise ValueError("Image could not be read.")
-
-    if img.ndim == 2:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-    return img
-
-
-def save_image(path, img):
-    ext = Path(path).suffix.lower()
-
-    params = []
-
-    if ext in {".jpg", ".jpeg"}:
-        params = [cv2.IMWRITE_JPEG_QUALITY, 94]
-
-    elif ext == ".png":
-        params = [cv2.IMWRITE_PNG_COMPRESSION, 3]
-
-    elif ext == ".webp":
-        params = [cv2.IMWRITE_WEBP_QUALITY, 94]
-
-    ok = cv2.imwrite(path, img, params)
-
-    if not ok:
-        raise ValueError("Could not save processed image.")
-
-
-def bgr_for_processing(img):
-    if img.ndim == 2:
-        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-    if img.shape[2] == 4:
-        return img[:, :, :3]
-
-    return img
-
-
-def restore_alpha(original, processed):
-    if original.ndim == 3 and original.shape[2] == 4:
-        alpha = original[:, :, 3]
-        if processed.ndim == 2:
-            processed = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGRA)
-        else:
-            processed = cv2.cvtColor(processed, cv2.COLOR_BGR2BGRA)
-        processed[:, :, 3] = alpha
-        return processed
-
-    return processed
-
-
-# ============================================================
-# DETECTION
-# ============================================================
-
-def clean_mask(mask):
-    """
-    Cleans isolated noise while keeping a hand-drawn line.
-    """
-    kernel_close = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (7, 7)
-    )
-    kernel_open = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (3, 3)
-    )
-
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_CLOSE, kernel_close, iterations=1
-    )
-
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_OPEN, kernel_open, iterations=1
-    )
-
-    return mask
-
-
-def component_candidates(mask, image_shape):
-    """
-    Returns large plausible marking components.
-    """
-    h, w = image_shape[:2]
-
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask, connectivity=8
-    )
-
-    candidates = []
-
-    for i in range(1, n):
-        x, y, cw, ch, area = stats[i]
-
-        if area < 500:
-            continue
-
-        if cw < 50 or ch < 25:
-            continue
-
-        # Very large full-image components are usually photo content.
-        if cw > w * 0.90 and ch > h * 0.75:
-            continue
-
-        # Bottom GPS/location overlay is normally not the marking.
-        if y > h * 0.82:
-            continue
-
-        bbox_area = cw * ch
-        fill = area / max(1, bbox_area)
-
-        # Hand-drawn outline should not fill the entire bbox.
-        if fill > 0.55:
-            continue
-
-        roi = labels[y:y + ch, x:x + cw] == i
-
-        border = max(
-            5,
-            min(14, int(min(cw, ch) * 0.05))
-        )
-
-        border_band = np.zeros_like(roi, dtype=np.uint8)
-        border_band[:border, :] = 1
-        border_band[-border:, :] = 1
-        border_band[:, :border] = 1
-        border_band[:, -border:] = 1
-
-        border_density = (
-            (roi & (border_band > 0)).sum()
-            / max(1, roi.sum())
-        )
-
-        # Prefer components with pixels close to the bbox border.
-        score = (
-            min(area / 10000.0, 10.0)
-            + border_density * 20.0
-        )
-
-        candidates.append({
-            "label": i,
-            "x": int(x),
-            "y": int(y),
-            "w": int(cw),
-            "h": int(ch),
-            "area": int(area),
-            "fill": float(fill),
-            "border_density": float(border_density),
-            "score": float(score),
-        })
-
-    candidates.sort(
-        key=lambda c: c["score"],
-        reverse=True
-    )
-
-    return candidates, labels
-
-
-def green_detection(bgr):
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-
-    # Bright/saturated green.
-    mask = cv2.inRange(
-        hsv,
-        np.array([35, 70, 60], dtype=np.uint8),
-        np.array([95, 255, 255], dtype=np.uint8)
-    )
-
-    mask = clean_mask(mask)
-
-    candidates, labels = component_candidates(
-        mask, bgr.shape
-    )
-
-    if not candidates:
-        return None
-
-    # Green marking in the sample is a dominant large component.
-    best = candidates[0]
-
-    # Require reasonable size.
-    if best["w"] * best["h"] < bgr.shape[0] * bgr.shape[1] * 0.01:
-        return None
-
-    component = (
-        labels == best["label"]
-    ).astype(np.uint8) * 255
-
-    return {
-        "mask": component,
-        "bbox": (
-            best["x"],
-            best["y"],
-            best["w"],
-            best["h"]
-        ),
-        "method": "green",
-        "confidence": min(
-            0.99,
-            0.50
-            + min(best["border_density"], 0.20)
-            + min(best["area"] /
-                  (bgr.shape[0] * bgr.shape[1]) * 2.0, 0.30)
-        )
-    }
-
-
-def black_detection(bgr):
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-
-    # Dark ink / black marker.
-    mask = cv2.inRange(
-        gray,
-        0,
-        78
-    )
-
-    # Connect thick hand-drawn strokes.
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (9, 9)
-        ),
-        iterations=1
-    )
-
-    candidates, labels = component_candidates(
-        mask, bgr.shape
-    )
-
-    if not candidates:
-        return None
-
-    # Additional scoring for a rectangle-like outline.
-    scored = []
-
-    H, W = bgr.shape[:2]
-
-    for c in candidates:
-        x, y, w, h = (
-            c["x"], c["y"], c["w"], c["h"]
-        )
-
-        aspect = w / max(1, h)
-
-        # Most recce markings are not extremely thin.
-        if aspect < 1.15 or aspect > 8.0:
-            continue
-
-        area_ratio = (
-            (w * h) /
-            max(1, W * H)
-        )
-
-        if area_ratio < 0.01:
-            continue
-
-        score = c["score"]
-
-        # Strongly prefer outline-like components.
-        score += c["border_density"] * 25
-
-        # Prefer moderate fill.
-        if c["fill"] < 0.20:
-            score += 2.0
-
-        if 0.02 < area_ratio < 0.45:
-            score += 1.0
-
-        scored.append(
-            (score, c)
-        )
-
-    if not scored:
-        return None
-
-    scored.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    best = scored[0][1]
-
-    component = (
-        labels == best["label"]
-    ).astype(np.uint8) * 255
-
-    return {
-        "mask": component,
-        "bbox": (
-            best["x"],
-            best["y"],
-            best["w"],
-            best["h"]
-        ),
-        "method": "black",
-        "confidence": min(
-            0.98,
-            0.45
-            + min(best["border_density"], 0.25)
-            + (0.15 if best["fill"] < 0.20 else 0.0)
-        )
-    }
-
-
-# ============================================================
-# COLOR-INDEPENDENT FALLBACK
-# ============================================================
-
-def other_color_detection(bgr):
-    """
-    V8.1 fallback for rough rectangular markers that are not
-    green or black.
-
-    V8.1's proven black detector is intentionally kept unchanged.
-    This fallback is used only if Green + Black do not detect
-    anything, and requires a thin rectangular colored outline.
-    """
-
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-
-    # Saturated/colorful pixels.
-    mask = cv2.inRange(
-        hsv,
-        np.array([0, 105, 50], dtype=np.uint8),
-        np.array([179, 255, 255], dtype=np.uint8)
-    )
-
-    # Remove green because the dedicated green detector is more
-    # reliable and must remain the first priority.
-    green = cv2.inRange(
-        hsv,
-        np.array([35, 70, 50], dtype=np.uint8),
-        np.array([95, 255, 255], dtype=np.uint8)
-    )
-
-    mask = cv2.bitwise_and(
-        mask,
-        cv2.bitwise_not(green)
-    )
-
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (7, 7)
-        )
-    )
-
-    candidates, labels = component_candidates(
-        mask,
-        bgr.shape
-    )
-
-    if not candidates:
-        return None
-
-    H, W = bgr.shape[:2]
-    scored = []
-
-    for c in candidates:
-
-        x = c["x"]
-        y = c["y"]
-        w = c["w"]
-        h = c["h"]
-
-        aspect = w / max(1, h)
-        area_ratio = (
-            (w * h) /
-            max(1, W * H)
-        )
-
-        if aspect < 1.15 or aspect > 8.0:
-            continue
-
-        if area_ratio < 0.01 or area_ratio > 0.45:
-            continue
-
-        # Reject filled colorful objects.
-        if c["fill"] > 0.24:
-            continue
-
-        # Strong border concentration is required.
-        if c["border_density"] < 0.08:
-            continue
-
-        score = (
-            c["score"]
-            + c["border_density"] * 25
-        )
-
-        scored.append(
-            (score, c)
-        )
-
-    if not scored:
-        return None
-
-    scored.sort(
-        key=lambda item: item[0],
-        reverse=True
-    )
-
-    best = scored[0][1]
-
-    component = (
-        labels == best["label"]
-    ).astype(np.uint8) * 255
-
-    return {
-        "mask": component,
-        "bbox": (
-            best["x"],
-            best["y"],
-            best["w"],
-            best["h"]
-        ),
-        "method": "color",
-        "confidence": min(
-            0.90,
-            0.40
-            + min(
-                best["border_density"],
-                0.25
-            )
-            + min(
-                best["area"] /
-                max(1, H * W) * 2,
-                0.25
-            )
-        )
-    }
-
-
-# ============================================================
-# REMOVE ONLY THE MARKER LINE
-# ============================================================
-
-def make_line_only_mask(component_mask, bbox):
-    """
-    Important:
-    Do NOT erase the whole component because the target can
-    contain real dark text/details.
-
-    Only erase the portion of the detected component that lies
-    close to the outer bounding-box border.
-    """
-    x, y, w, h = bbox
-
-    roi = component_mask[
-        y:y + h,
-        x:x + w
-    ]
-
-    band = max(
-        7,
-        min(18, int(min(w, h) * 0.06))
-    )
-
-    border_band = np.zeros_like(
-        roi,
-        dtype=np.uint8
-    )
-
-    border_band[:band, :] = 255
-    border_band[-band:, :] = 255
-    border_band[:, :band] = 255
-    border_band[:, -band:] = 255
-
-    line_mask_roi = cv2.bitwise_and(
-        roi,
-        border_band
-    )
-
-    # Put back into full image coordinates.
-    full = np.zeros_like(
-        component_mask
-    )
-
-    full[
-        y:y + h,
-        x:x + w
-    ] = line_mask_roi
-
-    # Slight expansion removes antialiased marker edges.
-    full = cv2.dilate(
-        full,
-        cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (3, 3)
-        ),
-        iterations=1
-    )
-
-    return full
-
-
-# ============================================================
-# PROCESS IMAGE
-# ============================================================
-
-def process_image(
-    input_path,
-    output_path,
-    mode="Auto",
-    rectangle_thickness=4,
-    inpaint_radius=4
-):
-
-    original = read_image_from_file(
-        input_path
-    )
-
-    if original.shape[0] * original.shape[1] > MAX_IMAGE_PIXELS:
-        raise ValueError(
-            "Image is too large for safe processing."
-        )
-
-    bgr = bgr_for_processing(
-        original
-    )
-
-    detection = None
-
-    if mode in ("Auto", "Green"):
-        detection = green_detection(
-            bgr
-        )
-
-    if detection is None and mode in (
-        "Auto",
-        "Black"
-    ):
-        detection = black_detection(
-            bgr
-        )
-
-    # V8.1: only after the proven V8.1 Green + Black detectors
-    # fail, try other marker colors.
-    if detection is None and mode == "Auto":
-        detection = other_color_detection(
-            bgr
-        )
-
-    if detection is None:
-        # No reliable marking detected.
-        # Copy original image unchanged.
-        shutil.copyfile(
-            input_path,
-            output_path
-        )
-
-        clean_memory()
-
-        return {
-            "changed": False,
-            "method": "none",
-            "confidence": 0.0,
-            "bbox": None
-        }
-
-    # ================================================
-    # Build mask that removes only outer marker line
-    # ================================================
-
-    line_mask = make_line_only_mask(
-        detection["mask"],
-        detection["bbox"]
-    )
-
-    # ================================================
-    # Inpaint
-    # ================================================
-
-    repaired = cv2.inpaint(
-        bgr,
-        line_mask,
-        inpaintRadius=inpaint_radius,
-        flags=cv2.INPAINT_TELEA
-    )
-
-    # ================================================
-    # Draw professional rectangle
-    # ================================================
-
-    x, y, w, h = detection["bbox"]
-
-    H, W = repaired.shape[:2]
-
-    # Keep rectangle safely inside image.
-    x1 = max(0, x)
-    y1 = max(0, y)
-    x2 = min(W - 1, x + w - 1)
-    y2 = min(H - 1, y + h - 1)
-
-    cv2.rectangle(
-        repaired,
-        (x1, y1),
-        (x2, y2),
-        (0, 220, 0),
-        thickness=rectangle_thickness,
-        lineType=cv2.LINE_AA
-    )
-
-    # Restore alpha if original PNG has transparency.
-    result = restore_alpha(
-        original,
-        repaired
-    )
-
-    save_image(
-        output_path,
-        result
-    )
-
-    del original
-    del bgr
-    del repaired
-    del result
-    del line_mask
-    del detection
-
-    clean_memory()
-
-    return {
-        "changed": True,
-        "method": detection["method"],
-        "confidence": detection["confidence"],
-        "bbox": (
-            int(x),
-            int(y),
-            int(w),
-            int(h)
-        )
-    }
-
-
-# ============================================================
-# EXTRACT ONE MEDIA FILE
-# ============================================================
-
-def extract_media(
+def process_media(
     ppt_zip,
     media_path,
-    destination
+    work_dir,
+    mode,
+    thickness
 ):
 
-    with ppt_zip.open(
-        media_path,
-        "r"
-    ) as src:
+    ext = Path(
+        media_path
+    ).suffix.lower()
 
-        with open(
-            destination,
-            "wb"
-        ) as dst:
+    if ext not in SUPPORTED:
 
-            while True:
-                chunk = src.read(
-                    CHUNK_SIZE
+        return (
+            False,
+            "unsupported",
+            None
+        )
+
+    safe = (
+        media_path
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
+
+    original_path = os.path.join(
+        work_dir,
+        "original_" + safe
+    )
+
+    fixed_path = os.path.join(
+        work_dir,
+        "fixed_" + safe
+    )
+
+    try:
+
+        with ppt_zip.open(
+            media_path,
+            "r"
+        ) as src:
+
+            with open(
+                original_path,
+                "wb"
+            ) as dst:
+
+                while True:
+
+                    chunk = src.read(
+                        1024 * 1024
+                    )
+
+                    if not chunk:
+                        break
+
+                    dst.write(
+                        chunk
+                    )
+
+        with Image.open(
+            original_path
+        ) as img:
+
+            img.load()
+
+            original = img.convert(
+                "RGB"
+            )
+
+        result, changed = (
+            repair_image(
+                original,
+                mode,
+                thickness
+            )
+        )
+
+        if changed:
+
+            if ext == ".png":
+
+                result.save(
+                    fixed_path,
+                    format="PNG",
+                    optimize=False
                 )
 
-                if not chunk:
-                    break
+            elif ext in {
+                ".jpg",
+                ".jpeg"
+            }:
 
-                dst.write(
-                    chunk
+                result.save(
+                    fixed_path,
+                    format="JPEG",
+                    quality=94,
+                    optimize=False
                 )
+
+            elif ext == ".webp":
+
+                result.save(
+                    fixed_path,
+                    format="WEBP",
+                    quality=94
+                )
+
+            elif ext == ".bmp":
+
+                result.save(
+                    fixed_path,
+                    format="BMP"
+                )
+
+            result.close()
+
+            status = "fixed"
+
+        else:
+
+            # Exact original bytes.
+            shutil.copyfile(
+                original_path,
+                fixed_path
+            )
+
+            status = "unchanged"
+
+        original.close()
+
+        try:
+            os.remove(
+                original_path
+            )
+        except Exception:
+            pass
+
+        clean_mem()
+
+        return (
+            True,
+            status,
+            fixed_path
+        )
+
+    except Exception as e:
+
+        for p in [
+            original_path,
+            fixed_path
+        ]:
+
+            try:
+
+                if os.path.exists(p):
+                    os.remove(p)
+
+            except Exception:
+                pass
+
+        clean_mem()
+
+        return (
+            False,
+            str(e),
+            None
+        )
 
 
 # ============================================================
@@ -787,13 +1684,13 @@ def extract_media(
 # ============================================================
 
 def build_final_ppt(
-    original_ppt,
+    input_ppt,
     output_ppt,
     replacements
 ):
 
     with zipfile.ZipFile(
-        original_ppt,
+        input_ppt,
         "r"
     ) as zin:
 
@@ -806,10 +1703,10 @@ def build_final_ppt(
 
             for info in zin.infolist():
 
-                filename = info.filename
-
-                replacement = replacements.get(
-                    filename
+                replacement = (
+                    replacements.get(
+                        info.filename
+                    )
                 )
 
                 if (
@@ -820,8 +1717,10 @@ def build_final_ppt(
                     )
                 ):
 
-                    new_info = zipfile.ZipInfo(
-                        filename
+                    new_info = (
+                        zipfile.ZipInfo(
+                            info.filename
+                        )
                     )
 
                     new_info.date_time = (
@@ -843,8 +1742,9 @@ def build_final_ppt(
                         ) as dst:
 
                             while True:
+
                                 chunk = src.read(
-                                    CHUNK_SIZE
+                                    1024 * 1024
                                 )
 
                                 if not chunk:
@@ -852,6 +1752,7 @@ def build_final_ppt(
 
                                 dst.write(
                                     chunk
+
                                 )
 
                 else:
@@ -867,8 +1768,9 @@ def build_final_ppt(
                         ) as dst:
 
                             while True:
+
                                 chunk = src.read(
-                                    CHUNK_SIZE
+                                    1024 * 1024
                                 )
 
                                 if not chunk:
@@ -878,7 +1780,7 @@ def build_final_ppt(
                                     chunk
                                 )
 
-    clean_memory()
+    clean_mem()
 
 
 # ============================================================
@@ -886,89 +1788,58 @@ def build_final_ppt(
 # ============================================================
 
 st.title(
-    "🖼️ PPT Recce Mark Corrector V8.1"
+    "🟩 PPT Recce Mark Corrector V7.1"
 )
 
 st.write(
-    "Baked-in rough/hand-drawn marking ko "
-    "OpenCV se remove karke clean professional "
-    "rectangle banaye."
-)
-
-st.success(
-    "✅ No Gemini API • No OpenAI API • No API cost"
+    "Existing rough marking ko clean green professional "
+    "rectangle me convert karta hai."
 )
 
 st.info(
-    "Processing local/OpenCV based hai. "
-    "800+ slides ke liye images one-by-one process hongi."
+    "Green/Black ke saath V7 red, blue, yellow, orange jaise "
+    "other-color rough rectangular markings ko bhi detect kar sakta hai. "
+    "Confident marking na mile to image untouched rahegi."
 )
 
-
-# ============================================================
-# OPTIONS
-# ============================================================
-
-with st.expander(
-    "⚙️ Detection Settings",
-    expanded=True
-):
-
-    detection_mode = st.selectbox(
-        "Marking colour",
-        [
-            "Auto",
-            "Green",
-            "Black"
-        ],
-        index=0
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        rectangle_thickness = st.slider(
-            "Professional rectangle thickness",
-            min_value=1,
-            max_value=12,
-            value=4
-        )
-
-    with col2:
-
-        inpaint_radius = st.slider(
-            "Background repair strength",
-            min_value=1,
-            max_value=8,
-            value=4
-        )
-
-st.subheader(
-    "📂 Upload PowerPoint"
+mode = st.selectbox(
+    "Marking type",
+    [
+        "Auto",
+        "Green",
+        "Black"
+    ]
 )
 
-uploaded_file = st.file_uploader(
+thickness = st.slider(
+    "Green rectangle thickness",
+    2,
+    8,
+    4
+)
+
+uploaded = st.file_uploader(
     "PPTX upload karo — maximum 300 MB",
     type=["pptx"]
 )
 
-
-if uploaded_file:
+if uploaded:
 
     size_mb = (
-        uploaded_file.size /
+        uploaded.size /
         (1024 * 1024)
     )
 
     st.write(
-        f"📦 File size: **{size_mb:.2f} MB**"
+        f"📦 PPT Size: **{size_mb:.2f} MB**"
     )
 
     if size_mb > MAX_PPT_MB:
+
         st.error(
             "❌ PPT 300 MB se badi hai."
         )
+
         st.stop()
 
     if st.button(
@@ -978,7 +1849,7 @@ if uploaded_file:
     ):
 
         work_dir = tempfile.mkdtemp(
-            prefix="ppt_mark_"
+            prefix="ppt_recce_v5_"
         )
 
         input_ppt = os.path.join(
@@ -988,53 +1859,41 @@ if uploaded_file:
 
         output_ppt = os.path.join(
             work_dir,
-            "Professional_Marked.pptx"
+            "Professional.pptx"
         )
 
         try:
 
-            # ==========================================
-            # SAVE PPT
-            # ==========================================
-
             with st.status(
-                "📥 PPT save ho rahi hai...",
-                expanded=True
-            ) as status:
+                "📥 PPT save ho rahi hai..."
+            ) as s:
 
-                save_uploaded = open(
+                with open(
                     input_ppt,
                     "wb"
-                )
+                ) as f:
 
-                try:
                     while True:
-                        chunk = uploaded_file.read(
-                            CHUNK_SIZE
+
+                        chunk = uploaded.read(
+                            1024 * 1024
                         )
 
                         if not chunk:
                             break
 
-                        save_uploaded.write(
+                        f.write(
                             chunk
                         )
-                finally:
-                    save_uploaded.close()
 
-                status.update(
+                s.update(
                     label="✅ PPT save ho gayi",
                     state="complete"
                 )
 
-            # ==========================================
-            # FIND IMAGES
-            # ==========================================
-
             with st.status(
-                "🔎 Slides ki images identify ho rahi hain...",
-                expanded=True
-            ) as status:
+                "🔎 Images identify ho rahi hain..."
+            ) as s:
 
                 media_paths = (
                     get_slide_media_references(
@@ -1042,48 +1901,35 @@ if uploaded_file:
                     )
                 )
 
-                raster_paths = [
-                    p for p in media_paths
-                    if Path(p).suffix.lower()
-                    in SUPPORTED
-                ]
-
-                status.write(
-                    f"Unique slide images: "
-                    f"**{len(raster_paths)}**"
+                s.write(
+                    f"Unique images: **{len(media_paths)}**"
                 )
 
-                status.update(
+                s.update(
                     label="✅ Images identify ho gayi",
                     state="complete"
                 )
 
-            if not raster_paths:
+            if not media_paths:
+
                 st.warning(
-                    "PPT me supported JPG/PNG/WebP/BMP "
-                    "images nahi mili."
+                    "Supported raster images nahi mili."
                 )
+
                 st.stop()
-
-            # ==========================================
-            # PROCESS
-            # ==========================================
-
-            st.subheader(
-                "⚙️ Image Processing"
-            )
 
             progress = st.progress(
                 0
             )
 
-            current = st.empty()
+            status = st.empty()
 
             replacements = {}
 
-            changed = 0
+            fixed = 0
             unchanged = 0
             failed = 0
+            skipped = 0
 
             with zipfile.ZipFile(
                 input_ppt,
@@ -1091,105 +1937,75 @@ if uploaded_file:
             ) as ppt_zip:
 
                 total = len(
-                    raster_paths
+                    media_paths
                 )
 
-                for number, media_path in enumerate(
-                    raster_paths,
-                    start=1
+                for i, media_path in enumerate(
+                    media_paths,
+                    1
                 ):
 
                     name = Path(
                         media_path
                     ).name
 
-                    current.write(
-                        f"🖼️ {number}/{total} — {name}"
+                    status.write(
+                        f"🖼️ {i}/{total} — {name}"
                     )
 
-                    source_path = os.path.join(
-                        work_dir,
-                        "src_" + name
-                    )
-
-                    output_path = os.path.join(
-                        work_dir,
-                        "out_" + name
-                    )
-
-                    try:
-
-                        extract_media(
+                    ok, result, fixed_path = (
+                        process_media(
                             ppt_zip,
                             media_path,
-                            source_path
+                            work_dir,
+                            mode,
+                            thickness
                         )
+                    )
 
-                        result = process_image(
-                            source_path,
-                            output_path,
-                            mode=detection_mode,
-                            rectangle_thickness=(
-                                rectangle_thickness
-                            ),
-                            inpaint_radius=(
-                                inpaint_radius
-                            )
-                        )
+                    if ok:
 
-                        if result["changed"]:
-
-                            replacements[
-                                media_path
-                            ] = output_path
-
-                            changed += 1
-
-                        else:
+                        if result == "unchanged":
 
                             unchanged += 1
 
-                    except Exception as e:
+                        else:
+
+                            fixed += 1
+
+                            replacements[
+                                media_path
+                            ] = fixed_path
+
+                    elif result == "unsupported":
+
+                        skipped += 1
+
+                    else:
 
                         failed += 1
 
                         st.warning(
-                            f"⚠️ {name} process nahi hua: "
-                            f"{e}"
+                            f"⚠️ {name}: {result}"
                         )
 
-                    finally:
-
-                        # Source can be deleted.
-                        # Replacement stays on disk until PPT build.
-                        try:
-                            if os.path.exists(
-                                source_path
-                            ):
-                                os.remove(
-                                    source_path
-                                )
-                        except Exception:
-                            pass
-
-                        clean_memory()
-
                     progress.progress(
-                        number / total
+                        i / total
                     )
 
-            current.write(
-                "✅ Image processing complete"
+                    clean_mem()
+
+            status.write(
+                f"✅ Complete — "
+                f"Fixed: {fixed} | "
+                f"Untouched: {unchanged} | "
+                f"Failed: {failed} | "
+                f"Skipped: {skipped}"
             )
 
-            # ==========================================
-            # BUILD PPT
-            # ==========================================
-
             with st.status(
-                "📦 Final PPT ban rahi hai...",
-                expanded=True
-            ) as status:
+                "📦 Final PPT ban rahi hai..."
+            ) as s:
 
                 build_final_ppt(
                     input_ppt,
@@ -1197,77 +2013,38 @@ if uploaded_file:
                     replacements
                 )
 
-                status.update(
+                s.update(
                     label="✅ Final PPT ready",
                     state="complete"
                 )
 
-            final_mb = (
-                os.path.getsize(output_ppt)
-                /
-                (1024 * 1024)
-            )
-
             st.success(
-                "🎉 Processing complete!"
-            )
-
-            c1, c2, c3, c4 = st.columns(4)
-
-            with c1:
-                st.metric(
-                    "Images found",
-                    len(raster_paths)
-                )
-
-            with c2:
-                st.metric(
-                    "Markings fixed",
-                    changed
-                )
-
-            with c3:
-                st.metric(
-                    "No marking",
-                    unchanged
-                )
-
-            with c4:
-                st.metric(
-                    "Failed",
-                    failed
-                )
-
-            st.write(
-                f"📦 Final PPT size: **{final_mb:.2f} MB**"
+                f"🎉 Done! "
+                f"{fixed} images repair hui aur "
+                f"{unchanged} images untouched rahi."
             )
 
             with open(
                 output_ppt,
                 "rb"
-            ) as download:
+            ) as f:
 
                 st.download_button(
                     "⬇️ Download Professional PPT",
-                    data=download,
+                    data=f,
                     file_name=(
                         Path(
-                            uploaded_file.name
+                            uploaded.name
                         ).stem
                         +
                         "_Professional.pptx"
                     ),
                     mime=(
-                        "application/vnd.openxmlformats-"
-                        "officedocument.presentationml.presentation"
+                        "application/vnd.openxmlformats-officedocument."
+                        "presentationml.presentation"
                     ),
                     use_container_width=True
                 )
-
-            st.info(
-                "Slide XML/layout ko modify nahi kiya gaya. "
-                "Sirf processed raster image files replace hui hain."
-            )
 
         except Exception as e:
 
@@ -1276,9 +2053,3 @@ if uploaded_file:
             )
 
             st.exception(e)
-
-        finally:
-
-            # Do not delete work_dir immediately because
-            # Streamlit's download button may still need the file.
-            clean_memory()
