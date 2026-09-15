@@ -12,7 +12,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 st.set_page_config(
-    page_title="PPT Recce Mark Corrector V7.4",
+    page_title="PPT Recce Mark Corrector V7.5",
     page_icon="🟩",
     layout="wide"
 )
@@ -774,6 +774,196 @@ def black_marker_mask(
 
 
 # ============================================================
+# V7.5: FREEHAND ENCLOSED MARKING DETECTOR
+# ============================================================
+def detect_freehand_outline_v75(bgr):
+    """
+    V7.5 targeted detector for freehand circles/ovals/irregular outlines.
+
+    It looks for a sparse, non-edge-connected ink loop that surrounds a
+    meaningful part of the photo. It is intentionally conservative and
+    returns one best candidate only.
+    """
+    H, W = bgr.shape[:2]
+    image_area = H * W
+    if H < 200 or W < 200:
+        return None, None
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    # Dark ink: black/charcoal. Exclude very dark image-border regions by
+    # requiring the eventual candidate to be inside the photo.
+    dark = ((gray < 72) & (hsv[:, :, 1] < 110)).astype(np.uint8) * 255
+
+    # Saturated non-green ink: catches purple/blue/red/orange freehand lines.
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    color = ((sat >= 90) & (val >= 55)).astype(np.uint8) * 255
+    green = cv2.inRange(hsv, np.array([35, 70, 45], np.uint8), np.array([90,255,255], np.uint8))
+    color = cv2.bitwise_and(color, cv2.bitwise_not(green))
+
+    ink = cv2.bitwise_or(dark, color)
+
+    # Close small gaps in hand-drawn strokes, but do not fill large regions.
+    ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((7,7), np.uint8), iterations=1)
+    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((2,2), np.uint8), iterations=1)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(ink, 8)
+    candidates = []
+
+    for i in range(1, n):
+        x, y, w, h, area = map(int, stats[i])
+        bbox_area = max(1, w*h)
+
+        if area < max(1800, int(image_area * 0.0012)):
+            continue
+        if w < max(110, int(W*0.14)) or h < max(70, int(H*0.08)):
+            continue
+        if w > W*0.80 or h > H*0.70:
+            continue
+        if x <= 3 or y <= 3 or x+w >= W-3 or y+h >= H-3:
+            continue
+        if y > H*0.82:
+            continue
+
+        fill = area / bbox_area
+        # A freehand outline is sparse; filled signs/objects are not.
+        if fill > 0.22:
+            continue
+
+        comp = (labels == i).astype(np.uint8)
+        band = max(3, int(min(w,h)*0.06))
+        crop = comp[y:y+h, x:x+w]
+        if crop.size == 0:
+            continue
+
+        top = crop[:band,:].mean()
+        bottom = crop[-band:,:].mean()
+        left = crop[:,:band].mean()
+        right = crop[:,-band:].mean()
+        sides = [top,bottom,left,right]
+        strong = sum(v >= 0.025 for v in sides)
+
+        # Closed/near-closed loop: at least 3 sides have ink support.
+        if strong < 3:
+            continue
+
+        # Interior should not itself be dominated by the same ink.
+        inner = crop[band:-band, band:-band] if crop.shape[0] > 2*band and crop.shape[1] > 2*band else crop
+        inner_ratio = float(inner.mean()) if inner.size else 1.0
+        if inner_ratio > 0.10:
+            continue
+
+        # Estimate loop-ness from contour perimeter versus bbox diagonal.
+        contours, _ = cv2.findContours((comp*255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            continue
+        c = max(contours, key=cv2.contourArea)
+        peri = cv2.arcLength(c, True)
+        if peri <= 0:
+            continue
+        approx = cv2.approxPolyDP(c, 0.035*peri, True)
+        vertices = len(approx)
+        if vertices < 5 or vertices > 40:
+            continue
+
+        aspect = w / max(1,h)
+        # Extremely thin horizontal/vertical objects are usually natural signs.
+        if aspect > 5.5 or aspect < 0.18:
+            continue
+
+        # Hand-drawn outlines usually have some ink thickness, but not a filled body.
+        perimeter_support = sum(sides)
+        score = (
+            strong * 3.0
+            + perimeter_support * 7.0
+            + min(3.0, area / max(1, image_area*0.01))
+            + min(2.0, vertices / 12.0)
+            - fill * 5.0
+            - inner_ratio * 4.0
+        )
+
+        candidates.append((score, x, y, w, h, comp))
+
+    if not candidates:
+        return None, None
+
+    candidates.sort(key=lambda z: z[0], reverse=True)
+    _, x, y, w, h, comp = candidates[0]
+
+    # Cleanup mask: use detected ink component and nearby matching ink,
+    # but never erase the interior of the target.
+    mask = comp * 255
+    dil = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)), iterations=1)
+
+    # Restrict cleanup to a thin band around the detected outline.
+    band = max(4, min(14, int(min(w,h)*0.035)))
+    ring = np.zeros_like(mask)
+    ring[y:y+h, x:x+w] = 255
+    inner = np.zeros_like(mask)
+    ix1, iy1 = x+band, y+band
+    ix2, iy2 = x+w-band, y+h-band
+    if ix2 > ix1 and iy2 > iy1:
+        inner[iy1:iy2, ix1:ix2] = 255
+    ring = cv2.bitwise_and(ring, cv2.bitwise_not(inner))
+    cleanup = cv2.bitwise_and(dil, ring)
+    cleanup = cv2.dilate(cleanup, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)), iterations=1)
+
+    return cleanup, [(x,y,w,h)]
+
+# ============================================================
+# V7.5: COLORED FREEHAND OUTLINE DETECTOR
+# ============================================================
+def detect_colored_freehand_outline_v75(bgr):
+    """Detect sparse saturated non-green freehand outlines (purple/blue/red/etc.)."""
+    H, W = bgr.shape[:2]
+    image_area = H * W
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hue, sat, val = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+
+    ink = ((sat >= 90) & (val >= 55)).astype(np.uint8) * 255
+    green = ((hue >= 35) & (hue <= 90) & (sat >= 70) & (val >= 45)).astype(np.uint8) * 255
+    ink = cv2.bitwise_and(ink, cv2.bitwise_not(green))
+    ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), iterations=1)
+    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((2,2), np.uint8), iterations=1)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(ink, 8)
+    candidates = []
+    for i in range(1, n):
+        x,y,w,h,area = map(int, stats[i])
+        fill = area / max(1,w*h)
+        if area < max(1800, int(image_area*0.0012)): continue
+        if w < max(110,int(W*0.14)) or h < max(70,int(H*0.08)): continue
+        if w > W*0.80 or h > H*0.70: continue
+        if x <= 3 or y <= 3 or x+w >= W-3 or y+h >= H-3: continue
+        if y > H*0.82 or fill > 0.22: continue
+        comp=(labels==i).astype(np.uint8)
+        band=max(3,int(min(w,h)*0.06))
+        cr=comp[y:y+h,x:x+w]
+        sides=[cr[:band,:].mean(),cr[-band:,:].mean(),cr[:,:band].mean(),cr[:,-band:].mean()]
+        strong=sum(v>=0.025 for v in sides)
+        if strong < 3: continue
+        aspect=w/max(1,h)
+        if aspect > 5.5 or aspect < 0.18: continue
+        contours,_=cv2.findContours((comp*255),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_NONE)
+        if not contours: continue
+        c=max(contours,key=cv2.contourArea); peri=cv2.arcLength(c,True)
+        if peri<=0: continue
+        approx=cv2.approxPolyDP(c,0.035*peri,True)
+        if len(approx)<4 or len(approx)>40: continue
+        # A natural filled sign/cloth normally has much higher fill.
+        score=strong*3.0 + sum(sides)*7.0 + min(3.0,area/max(1,image_area*0.01)) - fill*5.0
+        candidates.append((score,x,y,w,h,comp))
+    if not candidates: return None,None
+    candidates.sort(key=lambda z:z[0],reverse=True)
+    _,x,y,w,h,comp=candidates[0]
+    # Remove only the detected colored stroke and a tiny anti-aliased halo.
+    mask=comp*255
+    mask=cv2.dilate(mask,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)),iterations=1)
+    return mask,[(x,y,w,h)]
+
+# ============================================================
 # V7.4: BLACK HAND-DRAWN OUTLINE DETECTOR
 # ============================================================
 def detect_black_outline_v74(bgr):
@@ -1366,6 +1556,24 @@ def detect_markings(
             green_boxes,
             True
         )
+
+    # --------------------------------------------------------
+    # FREEHAND OUTLINE (V7.5)
+    # --------------------------------------------------------
+    # Run before the old rectangle logic. This catches circles/ovals and
+    # irregular black or colored outlines that are not axis-aligned.
+    free_mask, free_boxes = detect_freehand_outline_v75(bgr)
+    if free_boxes:
+        return free_mask, free_boxes, True
+
+    # --------------------------------------------------------
+    # FREEHAND COLORED OUTLINE (V7.5)
+    # --------------------------------------------------------
+    # Purple/blue/red/etc. freehand outlines are checked before the
+    # black legacy logic. Green remains handled by the dedicated detector.
+    color_free_mask, color_free_boxes = detect_colored_freehand_outline_v75(bgr)
+    if color_free_boxes:
+        return color_free_mask, color_free_boxes, True
 
     # --------------------------------------------------------
     # BLACK
@@ -1985,7 +2193,7 @@ def build_final_ppt(
 # ============================================================
 
 st.title(
-    "🟩 PPT Recce Mark Corrector V7.4"
+    "🟩 PPT Recce Mark Corrector V7.5"
 )
 
 st.write(
