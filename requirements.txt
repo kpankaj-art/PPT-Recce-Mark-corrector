@@ -1,4 +1,4 @@
 streamlit
-google-genai
-openai
+opencv-python-headless
+numpy
 Pillow
