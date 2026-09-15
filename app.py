@@ -12,7 +12,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 st.set_page_config(
-    page_title="PPT Recce Mark Corrector V7.2",
+    page_title="PPT Recce Mark Corrector V7.4",
     page_icon="🟩",
     layout="wide"
 )
@@ -772,6 +772,137 @@ def black_marker_mask(
     )
 
 
+
+# ============================================================
+# V7.4: BLACK HAND-DRAWN OUTLINE DETECTOR
+# ============================================================
+def detect_black_outline_v74(bgr):
+    """
+    V7.4 targeted black-marker detector.
+
+    The important difference from V7.2 is that the marker is first
+    isolated as a thick dark structure. This catches the large,
+    slightly irregular hand-drawn outlines used in some recce PPTs
+    without making the old V7 detector more aggressive.
+
+    It is intentionally conservative: if no strong outline is found,
+    return no detection and let the legacy V7 detector have a chance.
+    """
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    H, W = gray.shape
+    image_area = H * W
+
+    # Pure black / very dark marker ink.
+    dark = (gray < 45).astype(np.uint8) * 255
+
+    # Remove isolated thin details while preserving the thick
+    # hand-drawn marker stroke.
+    thick = cv2.morphologyEx(
+        dark,
+        cv2.MORPH_OPEN,
+        np.ones((3, 3), np.uint8)
+    )
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        thick,
+        8
+    )
+
+    candidates = []
+
+    for i in range(1, n):
+        x, y, w, h, area = map(int, stats[i])
+
+        if area < max(3000, int(image_area * 0.004)):
+            continue
+        if w < W * 0.18 or h < H * 0.08:
+            continue
+        if w > W * 0.95 or h > H * 0.60:
+            continue
+        if y > H * 0.75:
+            continue
+
+        fill = area / max(1, w * h)
+        if fill > 0.18:
+            continue
+
+        comp = (labels == i).astype(np.uint8)
+
+        band = max(3, int(min(w, h) * 0.08))
+        top = comp[y:min(H, y + band), x:x+w].mean()
+        bottom = comp[max(y, y+h-band):min(H, y+h), x:x+w].mean()
+        left = comp[y:y+h, x:min(W, x+band)].mean()
+        right = comp[y:y+h, max(x, x+w-band):min(W, x+w)].mean()
+        sides = [top, bottom, left, right]
+
+        strong = sum(v >= 0.04 for v in sides)
+        if strong < 3:
+            continue
+
+        # Prefer a true outline: useful support on several sides and
+        # a relatively sparse component inside its bounding box.
+        side_score = sum(sides)
+        score = (
+            strong * 2.0
+            + side_score * 5.0
+            + min(2.0, area / max(1, image_area * 0.02))
+            + (0.18 - fill) * 2.0
+        )
+
+        candidates.append((
+            score,
+            int(x), int(y), int(w), int(h),
+            comp
+        ))
+
+    if not candidates:
+        return None, None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, x, y, w, h, comp = candidates[0]
+
+    # Build a cleanup mask from the detected thick marker plus only
+    # dark pixels close to its four sides. The center is never erased.
+    mask = comp * 255
+    raw_dark = (gray < 70).astype(np.uint8) * 255
+
+    side_band = max(5, min(14, int(min(w, h) * 0.035)))
+    perimeter = np.zeros_like(mask)
+
+    perimeter[
+        max(0, y-side_band):min(H, y+side_band+1),
+        max(0, x-side_band):min(W, x+w+side_band+1)
+    ] = 0
+
+    # Top / bottom / left / right narrow regions.
+    perimeter[
+        max(0, y-side_band):min(H, y+side_band+1),
+        x:min(W, x+w)
+    ] = 255
+    perimeter[
+        max(0, y+h-side_band):min(H, y+h+side_band+1),
+        x:min(W, x+w)
+    ] = 255
+    perimeter[
+        y:min(H, y+h),
+        max(0, x-side_band):min(W, x+side_band+1)
+    ] = 255
+    perimeter[
+        y:min(H, y+h),
+        max(0, x+w-side_band):min(W, x+w+side_band+1)
+    ] = 255
+
+    side_dark = cv2.bitwise_and(raw_dark, perimeter)
+    mask = cv2.bitwise_or(mask, side_dark)
+
+    mask = cv2.dilate(
+        mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1
+    )
+
+    return mask, [(x, y, w, h)]
+
 # ============================================================
 # V7 FALLBACK: OTHER COLORS
 # ============================================================
@@ -1240,61 +1371,71 @@ def detect_markings(
     # BLACK
     # --------------------------------------------------------
 
+    # V7.4 first handles the large hand-drawn black outlines that
+    # are not reliably represented as an axis-aligned rectangle.
+    v74_mask, v74_boxes = detect_black_outline_v74(bgr)
+
+    if v74_boxes:
+        return (
+            v74_mask,
+            v74_boxes,
+            True
+        )
+
+    # Legacy V7 detector remains as a conservative fallback for
+    # smaller black markings (for example image10-style signs).
     rectangle, _ = find_black_rectangle(
         bgr
     )
 
     if rectangle is not None:
 
-        black_mask, found = (
-            black_marker_mask(
+        # Reject legacy candidates whose interior is itself mostly
+        # dark. Those are commonly storefront/awning structures,
+        # not a hand-drawn outline. V7.4 already handled the true
+        # large-outline cases above.
+        rx1, ry1, rx2, ry2 = rectangle
+        pad = max(8, min(20, int(min(rx2-rx1, ry2-ry1) * 0.10)))
+        ix1 = min(bgr.shape[1]-1, rx1 + pad)
+        iy1 = min(bgr.shape[0]-1, ry1 + pad)
+        ix2 = max(ix1+1, rx2 - pad)
+        iy2 = max(iy1+1, ry2 - pad)
+        gray_local = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        interior = gray_local[iy1:iy2, ix1:ix2]
+        interior_mean = float(interior.mean()) if interior.size else 0.0
+        small_legacy_ok = (
+            interior_mean >= 90.0
+            and
+            ((rx2-rx1)*(ry2-ry1)) <= bgr.shape[0]*bgr.shape[1]*0.15
+        )
+
+        if small_legacy_ok:
+            black_mask, found = black_marker_mask(
                 bgr,
                 rectangle
             )
-        )
 
-        if found:
+            if found:
+                x1, y1, x2, y2 = rectangle
+                return (
+                    black_mask,
+                    [(x1, y1, x2-x1, y2-y1)],
+                    True
+                )
 
-            x1, y1, x2, y2 = rectangle
-
-            return (
-                black_mask,
-                [
-                    (
-                        x1,
-                        y1,
-                        x2-x1,
-                        y2-y1
-                    )
-                ],
-                True
-            )
-
-        # V7: difficult black marker touching original black
-        # border. Use side-band fallback.
-        fallback_mask, fallback_found = (
-            black_side_band_fallback(
+            # V7 legacy merged-border fallback.
+            fallback_mask, fallback_found = black_side_band_fallback(
                 bgr,
                 rectangle
             )
-        )
 
-        if fallback_found:
-
-            x1, y1, x2, y2 = rectangle
-
-            return (
-                fallback_mask,
-                [
-                    (
-                        x1,
-                        y1,
-                        x2-x1,
-                        y2-y1
-                    )
-                ],
-                True
-            )
+            if fallback_found:
+                x1, y1, x2, y2 = rectangle
+                return (
+                    fallback_mask,
+                    [(x1, y1, x2-x1, y2-y1)],
+                    True
+                )
 
     # --------------------------------------------------------
     # OTHER COLORS
@@ -1844,7 +1985,7 @@ def build_final_ppt(
 # ============================================================
 
 st.title(
-    "🟩 PPT Recce Mark Corrector V7.2"
+    "🟩 PPT Recce Mark Corrector V7.4"
 )
 
 st.write(
